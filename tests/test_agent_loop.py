@@ -115,3 +115,30 @@ def test_context_trimming_keeps_pairs(sample_repo):
     tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
     calls = [c for m in agent.messages if m["role"] == "assistant" for c in m["tool_calls"]]
     assert len(tool_msgs) == len(calls)
+
+
+def test_trace_never_contains_secrets_from_tool_arguments_or_reasons(sample_repo):
+    import json
+
+    from conftest import FAKE_KEY
+
+    pw = "Zq9xLm2pRt7vWn"  # synthetic
+    llm = ScriptedLLM(
+        [
+            [call("search_code", pattern=FAKE_KEY)],
+            [call("read_file", path="app/config.py")],
+            [call("record_finding", **SECRET_FINDING)],
+            [call("retract_finding", finding_id="F1", reason=f"saw {FAKE_KEY} and password = '{pw}' in the log")],
+            [call("no_such_tool", data={"nested": [f"password = '{pw}'", FAKE_KEY]})],
+            mark_all(),
+            [call("finish_audit")],
+        ]
+    )
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(self_review=False))
+    agent.run()
+    trace = json.dumps(agent.trace.to_dict())
+    assert FAKE_KEY not in trace and pw not in trace
+    # Still useful for debugging: the call, its tool name and the redaction marker are visible.
+    searches = [e for e in agent.trace.events if e["type"] == "tool_call" and e["name"] == "search_code"]
+    assert searches[0]["arguments"] == {"pattern": "[REDACTED:aws_access_key_id]"}
+    assert "F1" in agent.trace.events[-1]["retracted"]

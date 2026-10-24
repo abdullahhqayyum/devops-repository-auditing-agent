@@ -13,7 +13,7 @@ from typing import Any
 
 import prompts
 from llm_client import LLM, LLMResponse
-from redaction import redact
+from redaction import redact, redact_data
 from report import FindingRejected, FindingStore
 from tools import RepoTools, dispatch, tool_schemas
 
@@ -38,7 +38,8 @@ class Trace:
     started: float = field(default_factory=time.time)
 
     def add(self, kind: str, **data: Any) -> None:
-        self.events.append({"t": round(time.time() - self.started, 2), "type": kind, **data})
+        # Every event passes through redaction here, so no call site can write a secret into the trace.
+        self.events.append({"t": round(time.time() - self.started, 2), "type": kind, **redact_data(data)})
 
     def to_dict(self) -> dict[str, Any]:
         tool_counts = Counter(e["name"] for e in self.events if e["type"] == "tool_call")
@@ -167,7 +168,7 @@ class AuditAgent:
                 result = f"Recorded as {fid}."
             except FindingRejected as exc:
                 result = f"REJECTED: {exc}"
-            self.trace.add("finding", arguments=_redact_args(args), result=result)
+            self.trace.add("finding", arguments=args, result=result)
             log.info("record_finding %s %s:%s -> %s", args.get("rule_id"), args.get("file"), args.get("line"), result)
             return result
         if name == "retract_finding":
@@ -241,7 +242,3 @@ class AuditAgent:
                 if size <= self.config.context_char_budget * 0.7:
                     break
         self.trace.add("control", message="context trimmed", approx_chars=size)
-
-
-def _redact_args(args: dict[str, Any]) -> dict[str, Any]:
-    return {k: redact(v) if isinstance(v, str) else v for k, v in (args or {}).items()}
