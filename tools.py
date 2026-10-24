@@ -257,6 +257,9 @@ class RepoTools:
         try:
             text = self._read_text(target)
         except ToolError as exc:
+            # The model has now seen that the file exists and is binary, which is all a finding about it
+            # (for example a tracked .pyc) can rest on.
+            self.observed_files.add(rel)
             return f"{rel}: {exc}"
         lines = text.splitlines()
         if lines and is_env_style(rel):
@@ -365,11 +368,13 @@ class RepoTools:
                 report.append(
                     f"[{label}] {len(matches)} tracked: " + ", ".join(matches[:15]) + (" ..." if len(matches) > 15 else "")
                 )
+                self.observed_files.update(matches[:15])  # only the files this output actually names
         ignored = [p for p in self._git("ls-files", "-ci", "--exclude-standard").splitlines() if p]
         if ignored:
             report.append(
                 f"[tracked_but_gitignored] {len(ignored)} file(s) tracked despite matching .gitignore: " + ", ".join(ignored[:15])
             )
+            self.observed_files.update(ignored[:15])
         gi = self.root / ".gitignore"
         report.append(".gitignore present at root: " + ("yes" if gi.is_file() else "NO"))
         large = []
@@ -382,6 +387,7 @@ class RepoTools:
                 large.append(f"{f} ({size // 1_000_000} MB)")
         if large:
             report.append("[large_files>5MB] " + ", ".join(large[:10]))
+            self.observed_files.update(entry.rsplit(" (", 1)[0] for entry in large[:10])
         if len(report) == 1:
             report.insert(0, "No suspicious tracked artifacts found.")
         report.append("Note: verify context before reporting (e.g. fixtures, intentionally vendored files, sample data).")

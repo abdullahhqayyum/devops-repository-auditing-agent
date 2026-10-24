@@ -278,3 +278,82 @@ def test_run_ruff_registers_reported_files_as_inspected_with_posix_paths(tmp_pat
     tools.run_ruff()
     assert {"app/main.py", ".tools/helper.py"} <= tools.observed_files
     assert not any("\\" in f for f in tools.observed_files)
+
+
+# ------------------------------------------- findings about tracked binary artifacts (e.g. a committed .pyc)
+PYC = "app/__pycache__/m.cpython-311.pyc"
+
+
+def _binary_repo(tmp_path, extra=None):
+    from conftest import make_git_repo
+
+    files = {"README.md": "# x\n", ".gitignore": "*.log\n", PYC: "\x00compiled\x00", "app/main.py": "x = 1\n", **(extra or {})}
+    return make_git_repo(tmp_path / "bin", files)
+
+
+def _hyg003(file):
+    return {
+        "rule_id": "HYG-003",
+        "category": "repository_hygiene",
+        "severity": "medium",
+        "file": file,
+        "line": 1,
+        "description": "Tracked Python bytecode",
+        "evidence": "The bytecode file is tracked in git",
+        "recommendation": "Remove it from git and ignore __pycache__/",
+    }
+
+
+def test_reading_a_binary_tracked_file_registers_it_as_seen(tmp_path):
+    t = RepoTools(_binary_repo(tmp_path))
+    assert "binary file; not displayed" in t.read_file(PYC)
+    assert PYC in t.observed_files
+
+
+def test_inspect_tracked_artifacts_registers_only_the_files_it_names(tmp_path):
+    t = RepoTools(_binary_repo(tmp_path))
+    out = t.inspect_tracked_artifacts()
+    assert PYC in out and PYC in t.observed_files
+    assert "app/main.py" not in t.observed_files and "README.md" not in t.observed_files
+
+
+def test_a_finding_about_a_tracked_binary_artifact_needs_the_agent_to_have_seen_it(tmp_path):
+    from report import FindingRejected, FindingStore
+
+    repo = _binary_repo(tmp_path)
+    unseen = RepoTools(repo)
+    with pytest.raises(FindingRejected, match="not inspected"):
+        FindingStore(unseen).add(_hyg003(PYC))  # grounding is intact: nothing has looked at the file yet
+    seen = RepoTools(repo)
+    seen.inspect_tracked_artifacts()
+    assert FindingStore(seen).add(_hyg003(PYC)) == "F1"  # once the tool has named it, the finding can cite it
+    read_only = RepoTools(repo)
+    read_only.read_file(PYC)
+    assert FindingStore(read_only).add(_hyg003(PYC)) == "F1"
+
+
+def test_listing_a_file_is_still_not_inspecting_it(tmp_path):
+    from report import FindingRejected, FindingStore
+
+    t = RepoTools(_binary_repo(tmp_path))
+    assert PYC in t.list_files()
+    assert PYC not in t.observed_files
+    with pytest.raises(FindingRejected, match="not inspected"):
+        FindingStore(t).add(_hyg003(PYC))
+
+
+def test_artifacts_beyond_the_display_limit_are_not_registered(tmp_path):
+    many = {f"pkg{i}/__pycache__/m.cpython-311.pyc": "\x00x\x00" for i in range(20)}
+    t = RepoTools(_binary_repo(tmp_path, many))
+    out = t.inspect_tracked_artifacts()
+    assert "21 tracked" in out and "..." in out
+    shown = {f for f in t.observed_files if f.endswith(".pyc")}
+    assert len(shown) == 15 and all(f in out for f in shown)
+
+
+def test_files_tracked_despite_gitignore_are_registered_when_named(tmp_path):
+    # *.dat matches none of the artifact categories, so only the tracked-but-gitignored branch can register it.
+    t = RepoTools(_binary_repo(tmp_path, {".gitignore": "*.dat\n", "data/blob.dat": "x\n"}))
+    out = t.inspect_tracked_artifacts()
+    assert "tracked_but_gitignored" in out and "data/blob.dat" in out
+    assert "data/blob.dat" in t.observed_files
