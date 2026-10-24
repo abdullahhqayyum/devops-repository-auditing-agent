@@ -1,6 +1,10 @@
+import sys
+from types import SimpleNamespace
+
 import pytest
 from conftest import FAKE_KEY
 
+import tools as tools_module
 from tools import RepoTools, dispatch, tool_schemas
 
 
@@ -207,3 +211,70 @@ def test_unrelated_programming_errors_are_not_swallowed(sample_repo, monkeypatch
     monkeypatch.setattr(t, "list_files", lambda **_: {}["missing"])
     with pytest.raises(KeyError):
         dispatch(t, "list_files", {})
+
+
+# ---------------------------------------------------------------- run_ruff detection
+def _no_ruff_anywhere(monkeypatch, tmp_path):
+    """Pretend ruff is installed nowhere: not importable, not beside the interpreter, not on PATH."""
+    monkeypatch.setattr(tools_module, "importlib", SimpleNamespace(util=SimpleNamespace(find_spec=lambda *_a, **_k: None)))
+    monkeypatch.setattr(tools_module, "sys", SimpleNamespace(executable=str(tmp_path / "empty-bin" / "python")))
+    monkeypatch.setattr(tools_module.shutil, "which", lambda *_a, **_k: None)
+
+
+def test_run_ruff_works_when_ruff_is_not_on_path(sample_repo, monkeypatch):
+    """Regression: with the virtual environment not activated ruff is not on PATH, but the running interpreter has it."""
+    monkeypatch.setattr(tools_module.shutil, "which", lambda *_a, **_k: None)
+    out = RepoTools(sample_repo).run_ruff()
+    assert "not installed" not in out and "unavailable" not in out
+    assert "issue(s) across" in out and "E722" in out
+
+
+def test_ruff_command_prefers_the_running_interpreter_over_path(monkeypatch):
+    monkeypatch.setattr(tools_module.shutil, "which", lambda *_a, **_k: "/somewhere/else/ruff")
+    assert tools_module._ruff_command() == [sys.executable, "-I", "-m", "ruff"]
+
+
+def test_ruff_command_falls_back_to_the_executable_beside_the_interpreter(monkeypatch, tmp_path):
+    _no_ruff_anywhere(monkeypatch, tmp_path)
+    bin_dir = tmp_path / "empty-bin"
+    bin_dir.mkdir()
+    exe = bin_dir / ("ruff.exe" if tools_module.os.name == "nt" else "ruff")
+    exe.write_text("")
+    assert tools_module._ruff_command() == [str(exe)]
+
+
+def test_ruff_command_falls_back_to_path_last(monkeypatch, tmp_path):
+    _no_ruff_anywhere(monkeypatch, tmp_path)
+    monkeypatch.setattr(tools_module.shutil, "which", lambda *_a, **_k: "/opt/tools/ruff")
+    assert tools_module._ruff_command() == ["/opt/tools/ruff"]
+
+
+def test_run_ruff_reports_unavailable_when_ruff_is_really_missing(sample_repo, monkeypatch, tmp_path):
+    _no_ruff_anywhere(monkeypatch, tmp_path)
+    assert tools_module._ruff_command() is None
+    for out in (RepoTools(sample_repo).run_ruff(), dispatch(RepoTools(sample_repo), "run_ruff", {})):
+        assert "not installed" in out and "unavailable" in out and "do not infer" in out
+        assert "issue(s)" not in out  # an unavailable check is not a finding
+
+
+def test_run_ruff_never_executes_repository_code(tmp_path):
+    """The audited repository is the working directory, so a ruff.py in it must not shadow the real package."""
+    from conftest import make_git_repo
+
+    repo = make_git_repo(
+        tmp_path / "evil",
+        {"ruff.py": "import pathlib\npathlib.Path('PWNED.txt').write_text('repository code ran')\n", "ok.py": "import os\n"},
+    )
+    out = RepoTools(repo).run_ruff()
+    assert not (repo / "PWNED.txt").exists()
+    assert "F401" in out  # the real ruff ran and linted the repository
+
+
+def test_run_ruff_registers_reported_files_as_inspected_with_posix_paths(tmp_path):
+    from conftest import make_git_repo
+
+    repo = make_git_repo(tmp_path / "r", {"app/main.py": "import os\n", ".tools/helper.py": "import sys\n"})
+    tools = RepoTools(repo)
+    tools.run_ruff()
+    assert {"app/main.py", ".tools/helper.py"} <= tools.observed_files
+    assert not any("\\" in f for f in tools.observed_files)

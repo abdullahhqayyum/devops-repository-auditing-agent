@@ -11,11 +11,13 @@ Design rules:
 from __future__ import annotations
 
 import fnmatch
+import importlib.util
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
@@ -104,6 +106,26 @@ UNTRUSTED_CONTEXTS = re.compile(
 
 class ToolError(Exception):
     """Raised for invalid tool input; the message is shown to the LLM."""
+
+
+def _ruff_command() -> list[str] | None:
+    """Command that runs the ruff installed for this interpreter, or None when ruff is not installed.
+
+    Tried in order: ``python -I -m ruff`` for the running interpreter (works when a virtual environment's
+    Scripts/bin directory is not on PATH), the ``ruff`` executable next to the interpreter, then ``ruff`` on PATH.
+
+    ``-I`` (isolated mode) is essential: the command runs with the audited repository as its working directory, and
+    without it a ``ruff.py`` or ``ruff/`` inside that repository would shadow the real package and execute
+    repository code.
+    """
+    if sys.executable and importlib.util.find_spec("ruff") is not None:
+        return [sys.executable, "-I", "-m", "ruff"]
+    if sys.executable:
+        sibling = Path(sys.executable).parent / ("ruff.exe" if os.name == "nt" else "ruff")
+        if sibling.is_file():
+            return [str(sibling)]
+    on_path = shutil.which("ruff")
+    return [on_path] if on_path else None
 
 
 class RepoTools:
@@ -531,8 +553,8 @@ class RepoTools:
 
     def run_ruff(self, path: str | None = None) -> str:
         """Run the ruff linter (static analysis only; does not execute repository code)."""
-        exe = shutil.which("ruff")
-        if not exe:
+        ruff = _ruff_command()
+        if not ruff:
             return "ruff is not installed in the agent environment; this check is unavailable (do not infer results)."
         py_files = [f for f in self.tracked_files() if f.endswith(".py")]
         if not py_files:
@@ -543,7 +565,7 @@ class RepoTools:
         has_config = any((self.root / c).is_file() for c in ("ruff.toml", ".ruff.toml")) or "[tool.ruff" in self._safe_read(
             "pyproject.toml"
         )
-        args = [exe, "check", "--no-cache", "--exit-zero", "--output-format", "concise", "--force-exclude"]
+        args = [*ruff, "check", "--no-cache", "--exit-zero", "--output-format", "concise", "--force-exclude"]
         if not has_config:
             args.append("--isolated")  # ruff defaults only; ignore any user-level config on the agent host
         args.append(target)
@@ -561,7 +583,9 @@ class RepoTools:
             return self._finish(head + f"\nruff error: {proc.stderr.strip()[:500]}")
         summary = ", ".join(f"{c}x{n}" for c, n in codes.most_common(15))
         for ln in lines[:60]:
-            self.observed_files.add(ln.split(":", 1)[0].lstrip("./"))
+            reported = self.normalize_path(ln.split(":", 1)[0])  # ruff prints backslashes on Windows
+            if reported:
+                self.observed_files.add(reported)
         return self._finish(
             f"{head}\nBy rule: {summary or 'none'}\n"
             + "\n".join(lines[:60])
