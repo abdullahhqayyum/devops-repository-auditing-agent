@@ -1,3 +1,4 @@
+import pytest
 from conftest import FAKE_KEY
 
 from tools import RepoTools, dispatch, tool_schemas
@@ -145,3 +146,64 @@ def test_ordinary_source_code_is_not_over_redacted(tmp_path):
     t = RepoTools(_env_repo(tmp_path))
     out = t.read_file("app.py") + t.search_code("get_token")
     assert "self.api_key = api_key" in out and "token = get_token()" in out
+
+
+MALFORMED_ARGUMENTS = [
+    ("list_files", {"path": {"x": 1}}, "path"),
+    ("list_files", {"path": ["a"]}, "path"),
+    ("list_files", {"pattern": 5}, "pattern"),
+    ("list_files", {"max_entries": "many"}, "max_entries"),
+    ("read_file", {"path": 5}, "path"),
+    ("read_file", {"path": "README.md", "start_line": {"a": 1}}, "start_line"),
+    ("read_file", {"path": "README.md", "end_line": "abc"}, "end_line"),
+    ("read_file", {"path": "README.md", "start_line": True}, "start_line"),
+    ("search_code", {"pattern": 5}, "pattern"),
+    ("search_code", {"pattern": "x", "path": 5}, "path"),
+    ("search_code", {"pattern": "x", "max_results": [1]}, "max_results"),
+    ("search_code", {"pattern": "x", "case_insensitive": "maybe"}, "case_insensitive"),
+    ("git_log", {"path": 5}, "path"),
+    ("git_log", {"max_count": "many"}, "max_count"),
+    ("git_show_commit", {"commit": 123}, "commit"),
+    ("scan_secrets", {"path": ["a"]}, "path"),
+    ("inspect_workflows", {"path": 7}, "path"),
+    ("run_ruff", {"path": 7}, "path"),
+]
+
+
+@pytest.mark.parametrize(("name", "args", "bad_key"), MALFORMED_ARGUMENTS)
+def test_malformed_arguments_return_a_tool_error_instead_of_raising(sample_repo, name, args, bad_key):
+    out = dispatch(RepoTools(sample_repo), name, args)
+    assert out.startswith("ERROR: invalid argument")
+    assert f"'{bad_key}'" in out and name in out
+
+
+def test_all_problems_are_reported_in_one_error(sample_repo):
+    out = dispatch(RepoTools(sample_repo), "read_file", {"path": 5, "start_line": {}})
+    assert "'path'" in out and "'start_line'" in out
+
+
+def test_non_object_arguments_are_rejected(sample_repo):
+    t = RepoTools(sample_repo)
+    assert "must be a JSON object" in dispatch(t, "list_files", ["app"])
+    assert "must be a JSON object" in dispatch(t, "list_files", "app")
+
+
+def test_lenient_coercions_still_work(sample_repo):
+    t = RepoTools(sample_repo)
+    assert "    2| DEBUG = True" in dispatch(t, "read_file", {"path": "app/config.py", "start_line": "2", "end_line": 3.0})
+    assert "showing first 5 files" in dispatch(t, "list_files", {"max_entries": "5"})
+    assert "No matches" not in dispatch(t, "search_code", {"pattern": "DEBUG", "case_insensitive": "true"})
+
+
+def test_none_and_unknown_arguments_are_ignored_with_a_note(sample_repo):
+    t = RepoTools(sample_repo)
+    out = dispatch(t, "list_files", {"path": None, "colour": "red"})
+    assert "app/config.py" in out and "ignored unknown argument(s): colour" in out
+    assert "ignored" not in dispatch(t, "list_files", {"path": None})
+
+
+def test_unrelated_programming_errors_are_not_swallowed(sample_repo, monkeypatch):
+    t = RepoTools(sample_repo)
+    monkeypatch.setattr(t, "list_files", lambda **_: {}["missing"])
+    with pytest.raises(KeyError):
+        dispatch(t, "list_files", {})

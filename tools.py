@@ -722,25 +722,88 @@ def tool_schemas(tools: RepoTools) -> list[dict[str, Any]]:
     return schemas
 
 
+def _json_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int | float):
+        return "number"
+    return {str: "string", dict: "object", list: "array"}.get(type(value), type(value).__name__)
+
+
+def _coerce_argument(value: Any, spec: dict[str, Any]) -> tuple[Any, str | None]:
+    """Check one LLM-provided argument against its schema entry; returns (value, error).
+
+    Accepts what model clients commonly send for numbers and flags (``"5"`` or ``5.0`` for an integer,
+    ``"true"`` for a boolean) and rejects everything else, so tools only ever see the declared types.
+    """
+    expected = spec.get("type", "string")
+    if expected == "string" and isinstance(value, str):
+        if "\0" in value:
+            return value, "must not contain NUL characters"
+        if "enum" in spec and value not in spec["enum"]:
+            return value, f"must be one of: {', '.join(spec['enum'])}"
+        return value, None
+    if expected == "integer" and not isinstance(value, bool):
+        if isinstance(value, int):
+            return value, None
+        if isinstance(value, float) and value.is_integer():
+            return int(value), None
+        if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+            return int(value), None
+    if expected == "boolean":
+        if isinstance(value, bool):
+            return value, None
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            return value.strip().lower() == "true", None
+    if expected not in ("string", "integer", "boolean"):
+        return value, None  # no other parameter types are declared today; leave them to the tool
+    return value, f"expected {expected}, got {_json_type(value)}"
+
+
 def dispatch(tools: RepoTools, name: str, arguments: dict[str, Any]) -> str:
-    """Execute a tool by name with LLM-provided arguments; errors become text for the LLM."""
-    allowed = {s["name"] for s in tool_schemas(tools)}
+    """Execute a tool by name with LLM-provided arguments; errors become text for the LLM.
+
+    Arguments are validated against the tool's schema first, so a malformed call yields a descriptive
+    ``ERROR:`` result the model can correct. Unexpected exceptions inside a tool are deliberately not caught here.
+    """
+    schemas = tool_schemas(tools)
+    allowed = {s["name"] for s in schemas}
     if name not in allowed:
         return f"ERROR: unknown tool '{name}'. Available: {', '.join(sorted(allowed))}"
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        return f"ERROR: arguments for {name} must be a JSON object, got {_json_type(arguments)}"
     fn: Callable[..., str] = getattr(tools, name)
-    schema = next(s for s in tool_schemas(tools) if s["name"] == name)
+    schema = next(s for s in schemas if s["name"] == name)
     props = schema["parameters"].get("properties", {})
-    clean = {k: v for k, v in (arguments or {}).items() if k in props and v is not None}
-    missing = [r for r in schema["parameters"].get("required", []) if r not in clean]
+    provided = {k: v for k, v in arguments.items() if v is not None}
+    missing = [r for r in schema["parameters"].get("required", []) if r not in provided]
     if missing:
         return f"ERROR: missing required argument(s): {', '.join(missing)}"
+    clean: dict[str, Any] = {}
+    problems: list[str] = []
+    for key, value in provided.items():
+        if key not in props:
+            continue
+        coerced, error = _coerce_argument(value, props[key])
+        if error:
+            problems.append(f"'{key}' {error}")
+        else:
+            clean[key] = coerced
+    if problems:
+        return f"ERROR: invalid argument(s) for {name}: " + "; ".join(problems)
+    unknown = sorted(str(k)[:40] for k in provided if k not in props)
     try:
-        return fn(**clean)
+        result = fn(**clean)
     except ToolError as exc:
         return f"ERROR: {exc}"
     except subprocess.TimeoutExpired:
         return f"ERROR: {name} timed out"
-    except (TypeError, ValueError) as exc:
-        return f"ERROR: invalid arguments for {name}: {exc}"
     except OSError as exc:
         return f"ERROR: {name} failed: {exc.strerror or exc}"
+    if unknown:
+        result += f"\n(note: ignored unknown argument(s): {', '.join(unknown)}; valid: {', '.join(props) or 'none'})"
+    return result

@@ -142,3 +142,18 @@ def test_trace_never_contains_secrets_from_tool_arguments_or_reasons(sample_repo
     searches = [e for e in agent.trace.events if e["type"] == "tool_call" and e["name"] == "search_code"]
     assert searches[0]["arguments"] == {"pattern": "[REDACTED:aws_access_key_id]"}
     assert "F1" in agent.trace.events[-1]["retracted"]
+
+
+def test_malformed_tool_arguments_do_not_end_the_run_and_the_model_sees_the_error(sample_repo):
+    def retry_after_error(messages):
+        error = last_tool_results(messages)[0]
+        assert error.startswith("ERROR: invalid argument(s) for list_files: 'path' expected string, got object")
+        return [call("list_files", path="app")]  # the model corrects itself and carries on
+
+    llm = ScriptedLLM([[call("list_files", path={"dir": "app"})], retry_after_error, mark_all(), [call("finish_audit")]])
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(self_review=False))
+    agent.run()
+    assert agent.finished
+    calls = [e for e in agent.trace.events if e["type"] == "tool_call"]
+    assert [c["name"] for c in calls] == ["list_files", "list_files"]
+    assert "app/config.py" in calls[1]["output_preview"]
