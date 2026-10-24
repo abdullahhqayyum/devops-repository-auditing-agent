@@ -1,0 +1,7 @@
+# Pinned, tested versions (ranges are declared in pyproject.toml).
+anthropic==1.15.0
+openai==3.35.1
+PyYAML==6.0.3
+python-dotenv==1.2.2
+ruff==0.17.1
+pytest==9.1.1

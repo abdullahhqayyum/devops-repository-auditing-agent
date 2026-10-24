@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local configuration and secrets
+.env
+.env.local
+
+# Agent outputs (sample_report.json is committed on purpose)
+report.json
+*.trace.json
+*.partial
+!sample_report.trace.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
