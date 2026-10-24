@@ -51,6 +51,14 @@ QUOTED_ASSIGNMENT = re.compile(
 )
 # NAME=value in .env-style files (unquoted).
 ENV_ASSIGNMENT = re.compile(rf"""(?im)^(?P<name>\s*(?:export\s+)?{SECRET_NAME})(?P<op>\s*=\s*)(?P<value>[^\s#'"]{{4,}})""")
+# NAME: value in YAML-style configuration (unquoted; the quoted form is handled by QUOTED_ASSIGNMENT). Not line-anchored,
+# so it also works behind line numbers, ``file:line:`` prefixes and diff markers. Which values count as secrets is decided
+# by _looks_like_yaml_secret, because this runs on every string and must leave ordinary code such as
+# ``token: Optional[str]`` alone.
+YAML_ASSIGNMENT = re.compile(
+    rf"""(?i)(?P<name>\b{SECRET_NAME})(?P<op>["']?[ \t]*:[ \t]+)(?P<value>[^\s#'"\[\]{{}}(),][^\s#'"\[\]{{}}(),]*)"""
+)
+YAML_SECRET_SYMBOLS = frozenset("!@$%^&*+=~")
 
 PLACEHOLDER_HINTS = (
     "changeme",
@@ -131,13 +139,36 @@ def redact(text: str) -> str:
         return f"{m.group('name')}{m.group('op')}{m.group('q')}[REDACTED:literal]{m.group('q')}"
 
     text = QUOTED_ASSIGNMENT.sub(_quoted, text)
-
+    text = YAML_ASSIGNMENT.sub(_redact_yaml_match, text)
     return ENV_ASSIGNMENT.sub(_redact_env_match, text)
 
 
 def _redact_env_match(m: re.Match[str]) -> str:
     value = m.group("value")
     if value.startswith("[REDACTED") or is_reference(value):
+        return m.group(0)
+    return f"{m.group('name')}{m.group('op')}[REDACTED:value]"
+
+
+def _looks_like_yaml_secret(value: str) -> bool:
+    """Heuristic for an unquoted YAML value under a secret-named key.
+
+    Redacts values that contain a digit or a symbol (``hunter2``, ``s3cr3t-Value!9``). Plain words (``required``,
+    ``inherit``, ``SecretStr``), references (``${{ secrets.X }}``, ``$VAR``, ``<placeholder>``), URLs, paths, YAML
+    tags and anchors, and small numbers or versions are left alone. A plain-word password such as ``correcthorse``
+    is therefore not detected; this is deliberate, to keep ordinary code and configuration readable.
+    """
+    if value.startswith("[REDACTED") or is_reference(value):
+        return False
+    if len(value) < 4 or value[0] in "!&*|>/~" or "://" in value:
+        return False
+    if re.fullmatch(r"\d{1,5}(?:\.\d+)*", value):
+        return False
+    return any(c.isdigit() for c in value) or any(c in YAML_SECRET_SYMBOLS for c in value)
+
+
+def _redact_yaml_match(m: re.Match[str]) -> str:
+    if not _looks_like_yaml_secret(m.group("value")):
         return m.group(0)
     return f"{m.group('name')}{m.group('op')}[REDACTED:value]"
 
