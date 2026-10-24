@@ -25,14 +25,14 @@ log = logging.getLogger("audit.llm")
 DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-5-5",
     "openai": "gpt-4.1",
-    "gemini": "gemini-3.5-flash",
+    "gemini": "gemini-3.6-flash",  # the model the live smoke and evaluation runs used successfully
     "ollama": "qwen3:8b",
 }
 # Tried in order when the default model has been retired (HTTP 404). Never used for an explicitly chosen model.
 FALLBACK_MODELS = {
     "anthropic": ["claude-sonnet-4-5"],
     "openai": ["gpt-4o", "gpt-5-mini"],
-    "gemini": ["gemini-flash-latest", "gemini-2.5-flash"],
+    "gemini": ["gemini-3.5-flash", "gemini-flash-latest", "gemini-2.5-flash"],
     "ollama": [],
 }
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"

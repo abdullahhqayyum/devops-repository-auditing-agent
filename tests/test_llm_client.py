@@ -133,3 +133,9 @@ def test_missing_model_without_fallback_is_fatal():
     llm = _fake_openai("retired-model", [], available="live-model")
     with pytest.raises(LLMError, match="not found"):
         llm.chat("sys", [{"role": "user", "content": "hi"}], [])
+
+
+def test_gemini_default_is_the_live_verified_model_and_keeps_older_names_as_fallbacks():
+    assert DEFAULT_MODELS["gemini"] == "gemini-3.6-flash"
+    assert FALLBACK_MODELS["gemini"][0] == "gemini-3.5-flash"  # tried only if the default is reported missing (404)
+    assert DEFAULT_MODELS["gemini"] not in FALLBACK_MODELS["gemini"]
