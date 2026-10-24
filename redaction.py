@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from typing import Any
 
 # Well-known token formats. Each match is replaced entirely.
 TOKEN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
@@ -131,14 +132,30 @@ def redact(text: str) -> str:
 
     text = QUOTED_ASSIGNMENT.sub(_quoted, text)
 
-    def _env(m: re.Match[str]) -> str:
-        value = m.group("value")
-        if value.startswith("[REDACTED") or is_reference(value):
-            return m.group(0)
-        return f"{m.group('name')}{m.group('op')}[REDACTED:value]"
+    return ENV_ASSIGNMENT.sub(_redact_env_match, text)
 
-    text = ENV_ASSIGNMENT.sub(_env, text)
-    return text
+
+def _redact_env_match(m: re.Match[str]) -> str:
+    value = m.group("value")
+    if value.startswith("[REDACTED") or is_reference(value):
+        return m.group(0)
+    return f"{m.group('name')}{m.group('op')}[REDACTED:value]"
+
+
+def is_env_style(path: str) -> bool:
+    """True for files whose unquoted ``NAME=value`` lines are configuration values (.env, .ini, .cfg, ...)."""
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return name.startswith(".env") or name.endswith((".env", ".ini", ".cfg", ".properties", ".conf"))
+
+
+def redact_env_values(text: str) -> str:
+    """Redact unquoted ``NAME=value`` assignments in raw file content.
+
+    ENV_ASSIGNMENT is anchored to the start of a line, so this must run on the file's own lines before a prefix
+    such as a line number, ``file:line:`` or a diff marker is added. Apply it only to env-style files
+    (:func:`is_env_style`): in source code the same pattern would hide ordinary assignments like ``token = get_token()``.
+    """
+    return ENV_ASSIGNMENT.sub(_redact_env_match, text)
 
 
 def find_secrets(text: str, env_style: bool = False) -> list[SecretHit]:
@@ -182,3 +199,14 @@ def find_secrets(text: str, env_style: bool = False) -> list[SecretHit]:
             for kind, placeholder in seen.items():
                 hits.append(SecretHit(kind, lineno, placeholder, redact(line.strip())[:300]))
     return hits
+
+
+def redact_data(value: Any) -> Any:
+    """Return a copy of ``value`` with every string, including those nested in dicts, lists and tuples, redacted."""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {k: redact_data(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [redact_data(v) for v in value]
+    return value

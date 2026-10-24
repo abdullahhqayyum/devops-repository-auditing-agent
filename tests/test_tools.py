@@ -93,3 +93,55 @@ def test_tools_do_not_modify_repo(sample_repo):
         dispatch(t, name, {})
     status = subprocess.run(["git", "status", "--porcelain", "--ignored"], cwd=sample_repo, capture_output=True, text=True)
     assert status.stdout.strip() == ""
+
+
+ENV_HEX = "a8f5f167f44f4964e6c998dee827110c"  # synthetic
+ENV_PW = "Zq9xLm2pRt7vWn"  # synthetic
+
+
+def _env_repo(tmp_path):
+    from conftest import make_git_repo
+
+    return make_git_repo(
+        tmp_path / "envrepo",
+        {
+            ".env": f"SECRET_KEY={ENV_HEX}\nDB_PASSWORD={ENV_PW}\nDEBUG=1\n",
+            "cfg/app.ini": f"api_key = {ENV_HEX}\n",
+            "app.py": "self.api_key = api_key\ntoken = get_token()\n",
+        },
+    )
+
+
+def test_read_file_redacts_unquoted_env_values(tmp_path):
+    t = RepoTools(_env_repo(tmp_path))
+    out = t.read_file(".env") + t.read_file("cfg/app.ini")
+    assert ENV_HEX not in out and ENV_PW not in out
+    assert "SECRET_KEY=[REDACTED:value]" in out and "DEBUG=1" in out  # still useful for debugging
+
+
+def test_search_code_redacts_unquoted_env_values(tmp_path):
+    t = RepoTools(_env_repo(tmp_path))
+    out = t.search_code("SECRET_KEY|DB_PASSWORD|api_key")
+    assert ENV_HEX not in out and ENV_PW not in out
+    assert ".env:1:SECRET_KEY=[REDACTED:value]" in out
+
+
+def test_git_show_commit_redacts_added_and_removed_env_values(tmp_path):
+    import subprocess
+
+    repo = _env_repo(tmp_path)
+    git = ["git", "-c", "user.name=T", "-c", "user.email=t@example.com"]
+    first = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    subprocess.run([*git, "rm", "-q", ".env"], cwd=repo, check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "remove env"], cwd=repo, check=True)
+    removed = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+    t = RepoTools(repo)
+    for sha in (first, removed):
+        out = t.git_show_commit(sha)
+        assert ENV_HEX not in out and ENV_PW not in out
+
+
+def test_ordinary_source_code_is_not_over_redacted(tmp_path):
+    t = RepoTools(_env_repo(tmp_path))
+    out = t.read_file("app.py") + t.search_code("get_token")
+    assert "self.api_key = api_key" in out and "token = get_token()" in out

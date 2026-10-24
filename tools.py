@@ -23,7 +23,7 @@ from typing import Any
 
 import yaml
 
-from redaction import find_secrets, redact
+from redaction import find_secrets, is_env_style, redact, redact_env_values
 
 MAX_READ_LINES = 400
 MAX_FILE_BYTES = 2_000_000
@@ -237,6 +237,9 @@ class RepoTools:
         except ToolError as exc:
             return f"{rel}: {exc}"
         lines = text.splitlines()
+        if lines and is_env_style(rel):
+            # Redact before line numbers are prefixed: the env pattern is anchored to the start of a line.
+            lines = redact_env_values("\n".join(lines)).split("\n")
         total = len(lines)
         start = max(1, int(start_line or 1))
         end = min(total, int(end_line) if end_line else start + MAX_READ_LINES - 1, start + MAX_READ_LINES - 1)
@@ -272,6 +275,9 @@ class RepoTools:
         for h in hits[:max_results]:
             file_part = h.split(":", 1)[0]
             self.observed_files.add(file_part)
+            hit = re.match(r"([^:]+:\d+:)(.*)$", h)
+            if hit and is_env_style(file_part):
+                h = hit.group(1) + redact_env_values(hit.group(2))
             shown.append(h[:400])
         files = Counter(h.split(":", 1)[0] for h in hits)
         summary = f"{len(hits)} match(es) in {len(files)} file(s)"
@@ -298,7 +304,28 @@ class RepoTools:
         if not re.fullmatch(r"[0-9a-fA-F]{4,40}", commit or ""):
             raise ToolError("commit must be a hex commit hash")
         out = self._git("show", "--stat", "--patch", "--format=%h %ad %an%n%s%n%b", "--date=short", commit)
-        return self._finish(out)
+        return self._finish(self._redact_diff(out))
+
+    @staticmethod
+    def _redact_diff(patch: str) -> str:
+        """Redact env-style assignments on added/removed/context lines; the diff marker hides them from the line anchor."""
+        lines = patch.split("\n")
+        current = old = ""
+        in_header = False  # file headers sit between "diff --git" and the first "@@"; content lines never do
+        for i, line in enumerate(lines):
+            if line.startswith("diff --git "):
+                in_header, current, old = True, "", ""
+            elif in_header:
+                if line.startswith("--- "):
+                    old = line[4:].removeprefix("a/")
+                elif line.startswith("+++ "):
+                    new = line[4:].removeprefix("b/")
+                    current = old if new == "/dev/null" else new
+                elif line.startswith("@@"):
+                    in_header = False
+            elif line[:1] in ("+", "-", " ") and is_env_style(current):
+                lines[i] = line[:1] + redact_env_values(line[1:])
+        return "\n".join(lines)
 
     def inspect_tracked_artifacts(self) -> str:
         """Find tracked files that are typically generated, local, temporary or secret,
@@ -355,9 +382,7 @@ class RepoTools:
                 text = self._read_text(target)
             except (ToolError, OSError):
                 continue
-            name = PurePosixPath(f).name
-            env_style = name.startswith(".env") or name.endswith((".env", ".ini", ".cfg", ".properties", ".conf"))
-            for hit in find_secrets(text, env_style=env_style):
+            for hit in find_secrets(text, env_style=is_env_style(f)):
                 if hit.likely_placeholder:
                     placeholder_count += 1
                     continue
