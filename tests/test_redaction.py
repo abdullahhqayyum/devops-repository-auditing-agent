@@ -1,6 +1,6 @@
 from conftest import FAKE_KEY
 
-from redaction import find_secrets, is_reference, looks_like_placeholder, redact
+from redaction import find_secrets, is_env_style, is_reference, looks_like_placeholder, redact, redact_data, redact_env_values
 
 
 def test_redacts_known_token_formats():
@@ -47,3 +47,27 @@ def test_find_secrets_ignores_placeholders_flagged():
 def test_redacts_escaped_quotes_inside_strings():
     out = redact('x = "password = \\"Sup3rS3cret!\\""')
     assert "Sup3rS3cret!" not in out
+
+
+def test_is_env_style_matches_config_files_only():
+    assert is_env_style(".env") and is_env_style("deploy/.env.production") and is_env_style("cfg/app.ini")
+    assert not is_env_style("app/config.py") and not is_env_style("README.md")
+
+
+def test_redact_env_values_works_on_raw_lines_only_for_assignments():
+    out = redact_env_values("SECRET_KEY=abcdef1234567890\nDEBUG=1\nAPI_TOKEN=${TOKEN}\n")
+    assert "abcdef1234567890" not in out
+    assert "DEBUG=1" in out and "API_TOKEN=${TOKEN}" in out
+
+
+def test_line_prefix_defeats_default_redact_which_is_why_env_values_are_redacted_first():
+    # Documents the root cause: the env pattern is anchored to the start of a line.
+    assert "abcdef1234567890" in redact("   1| SECRET_KEY=abcdef1234567890")
+
+
+def test_redact_data_handles_nested_structures_and_keeps_other_types():
+    data = {"a": [f"k = '{FAKE_KEY}'", {"b": (FAKE_KEY, 3, None, True)}], "n": 5}
+    out = redact_data(data)
+    assert FAKE_KEY not in str(out)
+    assert out["n"] == 5 and out["a"][1]["b"][1:] == [3, None, True]
+    assert data["a"][0].endswith(f"'{FAKE_KEY}'")  # input is not mutated
