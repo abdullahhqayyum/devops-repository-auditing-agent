@@ -1,0 +1,117 @@
+from fakes import ScriptedLLM, call
+
+import prompts
+from agent_loop import AuditAgent, AuditConfig
+from tools import RepoTools
+
+SECRET_FINDING = {
+    "rule_id": "SEC-001",
+    "category": "security",
+    "severity": "critical",
+    "file": "app/config.py",
+    "line": 3,
+    "description": "Hardcoded AWS access key",
+    "evidence": "AWS key literal assigned to AWS_KEY",
+    "recommendation": "Load from environment or a secrets manager and rotate the key",
+}
+
+
+def mark_all():
+    return [call("mark_reviewed", category=c, status="no_issues", note="checked") for c in prompts.CATEGORIES]
+
+
+def last_tool_results(messages):
+    out = []
+    for m in reversed(messages):
+        if m["role"] != "tool":
+            break
+        out.append(m["content"])
+    return out
+
+
+def test_loop_executes_tools_and_records_finding(sample_repo):
+    llm = ScriptedLLM(
+        [
+            [call("list_files")],
+            [call("read_file", path="app/config.py")],
+            [call("record_finding", **SECRET_FINDING)],
+            mark_all(),
+            [call("finish_audit", summary="done")],
+            [call("finish_audit", summary="done")],  # after self-review nudge
+        ]
+    )
+    agent = AuditAgent(llm, RepoTools(sample_repo), "https://github.com/x/y")
+    violations = agent.run()
+    assert [v["rule_id"] for v in violations] == ["SEC-001"]
+    assert agent.finished
+    names = [e["name"] for e in agent.trace.events if e["type"] == "tool_call"]
+    assert names == ["list_files", "read_file"]
+    # Tool output was fed back to the model.
+    assert any("app/config.py" in m.get("content", "") for m in llm.seen_messages[1] if m["role"] == "tool")
+
+
+def test_dynamic_follow_up_based_on_tool_output(sample_repo):
+    """The next action depends on what the previous tool returned."""
+
+    def react(messages):
+        result = last_tool_results(messages)[0]
+        line = next(ln for ln in result.splitlines() if "verify=False" in ln)
+        path = line.split(":", 1)[0]
+        return [call("read_file", path=path)]
+
+    llm = ScriptedLLM([[call("search_code", pattern="verify=False")], react, mark_all(), [call("finish_audit")]])
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(self_review=False))
+    agent.run()
+    reads = [e["arguments"] for e in agent.trace.events if e["type"] == "tool_call" and e["name"] == "read_file"]
+    assert reads == [{"path": "app/main.py"}]
+
+
+def test_finding_without_inspection_is_rejected(sample_repo):
+    llm = ScriptedLLM([[call("record_finding", **SECRET_FINDING)], mark_all(), [call("finish_audit")]])
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(self_review=False))
+    assert agent.run() == []
+    rejected = [e for e in agent.trace.events if e["type"] == "finding"]
+    assert "REJECTED" in rejected[0]["result"]
+
+
+def test_coverage_nudge_before_finishing(sample_repo):
+    llm = ScriptedLLM([[call("finish_audit")], [call("finish_audit")]])
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(self_review=False))
+    agent.run()
+    second_turn_tool_msgs = [m for m in llm.seen_messages[1] if m["role"] == "tool"]
+    assert "not been marked reviewed" in second_turn_tool_msgs[-1]["content"]
+    assert agent.finished
+
+
+def test_budget_exhaustion_enters_wrapup_and_blocks_inspection(sample_repo):
+    llm = ScriptedLLM([[call("list_files")]] * 3 + [[call("list_files")], [call("finish_audit")]])
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(max_steps=2, wrapup_steps=3))
+    agent.run()
+    assert agent.inspection_calls == 2
+    assert agent.finished
+    assert any("budget" in str(e.get("message", "")) for e in agent.trace.events if e["type"] == "control")
+
+
+def test_unknown_tool_and_bad_args_are_reported_not_fatal(sample_repo):
+    llm = ScriptedLLM([[call("delete_repo"), call("read_file")], mark_all(), [call("finish_audit")]])
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(self_review=False))
+    agent.run()
+    tool_msgs = [m["content"] for m in llm.seen_messages[1] if m["role"] == "tool"]
+    assert any("unknown tool" in t for t in tool_msgs)
+    assert any("missing required" in t for t in tool_msgs)
+
+
+def test_model_that_stops_calling_tools_terminates(sample_repo):
+    agent = AuditAgent(ScriptedLLM([]), RepoTools(sample_repo), "u")
+    assert agent.run() == []
+
+
+def test_context_trimming_keeps_pairs(sample_repo):
+    llm = ScriptedLLM([[call("read_file", path="app/config.py")] for _ in range(6)] + [mark_all(), [call("finish_audit")]])
+    agent = AuditAgent(
+        llm, RepoTools(sample_repo), "u", AuditConfig(context_char_budget=500, keep_recent_tool_results=1, self_review=False)
+    )
+    agent.run()
+    tool_msgs = [m for m in agent.messages if m["role"] == "tool"]
+    calls = [c for m in agent.messages if m["role"] == "assistant" for c in m["tool_calls"]]
+    assert len(tool_msgs) == len(calls)
