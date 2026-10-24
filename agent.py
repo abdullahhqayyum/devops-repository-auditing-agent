@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 from agent_loop import AuditAgent, AuditConfig
-from llm_client import LLMError, build_llm
+from llm_client import LLMBudgetExhausted, LLMError, build_llm
 from redaction import redact
 from repo_loader import RepoError, cleanup, clone_repository, parse_github_url, prepare_local_repository
 from report import build_report, validate_report, write_json_atomic
@@ -49,7 +49,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--timeout",
         type=int,
         default=None,
-        help="Wall-clock budget for the investigation in seconds (default 1500; 3600 for local Ollama models)",
+        help="Wall-clock budget in seconds (default 1500; 3600 for local Ollama). Running out ends the audit as incomplete "
+        "(exit 4, findings so far in <output>.partial). A request already in flight can overrun it slightly.",
     )
     p.add_argument(
         "--sandbox",
@@ -139,10 +140,16 @@ def main(argv: list[str] | None = None) -> int:
         try:
             violations = agent.run()
         except LLMError as exc:
-            partial = build_report(repo_label, agent.store.as_report_list())
+            # Incomplete audit: keep what was found in a clearly labeled partial file; the report path stays untouched.
+            reason = "time budget exhausted" if isinstance(exc, LLMBudgetExhausted) else "LLM failure"
+            partial = {
+                **build_report(repo_label, agent.store.as_report_list()),
+                "incomplete": True,
+                "stop_reason": redact(f"{reason}: {exc}")[:500],
+            }
             write_json_atomic(output.with_suffix(output.suffix + ".partial"), partial)
             _write_trace(args, output, agent)
-            return fail(EXIT_LLM, f"LLM failure, inspection incomplete ({exc}). Partial findings saved to {output}.partial")
+            return fail(EXIT_LLM, f"{reason}, investigation incomplete ({exc}). Partial findings saved to {output}.partial")
 
         # 5. Contract-checked output.
         report = build_report(repo_label, violations)
@@ -172,7 +179,8 @@ def _write_trace(args: argparse.Namespace, output: Path, agent: AuditAgent) -> N
         return
     path = Path(args.trace) if args.trace else output.with_name(output.stem + ".trace.json")
     try:
-        write_json_atomic(path, {"repository": agent.repo_url, "model": agent.llm.model, **agent.trace.to_dict()})
+        status = {"status": "incomplete", "stop_reason": agent.stop_reason} if agent.stop_reason else {"status": "complete"}
+        write_json_atomic(path, {"repository": agent.repo_url, "model": agent.llm.model, **status, **agent.trace.to_dict()})
     except OSError as exc:
         logging.getLogger("audit.cli").warning("could not write trace: %s", exc)
 
