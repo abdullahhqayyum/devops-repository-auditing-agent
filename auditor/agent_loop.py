@@ -11,10 +11,10 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, NoReturn
 
-import prompts
-from llm_client import LLM, LLMBudgetExhausted, LLMError, LLMResponse
-from redaction import redact, redact_data
-from report import FindingRejected, FindingStore
+from auditor import prompts
+from auditor.llm_client import LLM, LLMBudgetExhausted, LLMError, LLMResponse
+from auditor.redaction import redact, redact_data
+from auditor.report import FindingRejected, FindingStore
 from tools import RepoTools, dispatch, tool_schemas
 
 log = logging.getLogger("audit.agent")

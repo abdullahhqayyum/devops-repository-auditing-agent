@@ -329,13 +329,13 @@ def _retrying(call, attempts: int = TRANSIENT_ATTEMPTS, deadline: float | None =
 
 
 # Also scrub any old provider keys inherited from the shell if an error happens to echo one. These variables never
-# select a provider; redaction.py separately detects credentials inside repositories being audited.
+# select a provider; auditor.redaction separately detects credentials inside repositories being audited.
 _KEY_ENV_VARS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY")
 
 
 def _safe_message(exc: Exception | None, limit: int = 400) -> str:
     """Error text safe to log or show: pattern-redacted, with any configured API key removed, and truncated."""
-    from redaction import redact
+    from auditor.redaction import redact
 
     if exc is None:
         return ""

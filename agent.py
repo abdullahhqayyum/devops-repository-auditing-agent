@@ -12,11 +12,11 @@ import logging
 import sys
 from pathlib import Path
 
-from agent_loop import AuditAgent, AuditConfig
-from llm_client import LLMBudgetExhausted, LLMError, build_llm
-from redaction import redact
-from repo_loader import RepoError, cleanup, clone_repository, parse_github_url, prepare_local_repository
-from report import build_report, validate_report, write_json_atomic
+from auditor.agent_loop import AuditAgent, AuditConfig
+from auditor.llm_client import LLMBudgetExhausted, LLMError, build_llm
+from auditor.redaction import redact
+from auditor.repo_loader import RepoError, cleanup, clone_repository, parse_github_url, prepare_local_repository
+from auditor.report import build_report, validate_report, write_json_atomic
 from tools import RepoTools
 
 EXIT_OK = 0
