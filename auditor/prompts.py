@@ -137,7 +137,9 @@ Before each tool call, write one short sentence of reasoning (what you expect to
   1-based line number of the offending line (from read_file or search_code output). For problems about something
   ABSENT (no README, no tests, no lockfile, no CI) use file=null and line=null. For repository-wide issues use the most
   relevant file with line=null.
-* If later evidence shows a finding was wrong or an acceptable alternative exists, call retract_finding.
+* If later evidence shows a finding was wrong or an acceptable alternative exists, call retract_finding with the
+  finding's exact ID, rule_id, file and line from the recorded finding. A rejected record has no ID and must never
+  be retracted.
 * mark_reviewed(category, status, note) when you have finished looking at a category (status: issues_found,
   no_issues, not_applicable). This documents coverage; it is not a finding.
 * finish_audit() when every category has been reviewed. The report is generated from your recorded findings only.
@@ -196,11 +198,17 @@ AGENT_TOOL_SCHEMAS = [
     },
     {
         "name": "retract_finding",
-        "description": "Withdraw a previously recorded finding that turned out to be wrong or acceptable.",
+        "description": "Withdraw a previously recorded finding after confirming its exact identity. Rejected records have no ID.",
         "parameters": {
             "type": "object",
-            "properties": {"finding_id": {"type": "string"}, "reason": {"type": "string"}},
-            "required": ["finding_id", "reason"],
+            "properties": {
+                "finding_id": {"type": "string"},
+                "rule_id": {"type": "string", "description": "Rule ID of the active finding, such as CQ-001"},
+                "file": {"type": ["string", "null"], "description": "Exact file path of the active finding, or null"},
+                "line": {"type": ["integer", "null"], "description": "Exact 1-based line of the active finding, or null"},
+                "reason": {"type": "string"},
+            },
+            "required": ["finding_id", "rule_id", "file", "line", "reason"],
         },
     },
     {

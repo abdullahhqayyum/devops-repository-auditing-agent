@@ -46,9 +46,21 @@ class FindingStore:
         self.findings[fid] = f
         return fid
 
-    def retract(self, finding_id: str, reason: str) -> None:
-        if finding_id not in self.findings:
-            raise FindingRejected(f"no active finding with id {finding_id}; active ids: {', '.join(self.findings) or 'none'}")
+    def retract(self, finding_id: str, rule_id: str, file: Any, line: Any, reason: str) -> None:
+        finding = self.findings.get(finding_id)
+        if finding is None:
+            raise FindingRejected(f"no active finding with id {finding_id}; no state was changed")
+        expected_rule_id = str(rule_id).strip().upper()
+        expected_file = (
+            None
+            if file is None or str(file).strip().lower() in ("", "null", "none", "n/a")
+            else self.tools.normalize_path(str(file))
+        )
+        if isinstance(line, str) and line.strip().isdigit():
+            line = int(line)
+        expected_line = None if line in (None, 0) else line
+        if finding["rule_id"] != expected_rule_id or finding["file"] != expected_file or finding["line"] != expected_line:
+            raise FindingRejected(f"retraction target for {finding_id} does not match; no state was changed")
         self.findings.pop(finding_id)
         self.retracted[finding_id] = reason
 

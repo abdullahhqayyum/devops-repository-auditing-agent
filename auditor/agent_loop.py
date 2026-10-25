@@ -203,13 +203,19 @@ class AuditAgent:
                 fid = self.store.add(args)
                 result = f"Recorded as {fid}."
             except FindingRejected as exc:
-                result = f"REJECTED: {exc}"
+                result = f"REJECTED: no finding was created; no finding ID was allocated. {exc}"
             self.trace.add("finding", arguments=args, result=result)
             log.info("record_finding %s %s:%s -> %s", args.get("rule_id"), args.get("file"), args.get("line"), result)
             return result
         if name == "retract_finding":
             try:
-                self.store.retract(str(args.get("finding_id", "")), str(args.get("reason", "")))
+                self.store.retract(
+                    str(args.get("finding_id", "")),
+                    str(args.get("rule_id", "")),
+                    args.get("file"),
+                    args.get("line"),
+                    str(args.get("reason", "")),
+                )
                 result = f"Retracted {args.get('finding_id')}."
             except FindingRejected as exc:
                 result = f"ERROR: {exc}"
