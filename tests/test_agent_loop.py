@@ -123,6 +123,17 @@ def test_retraction_schema_requires_target_identity():
     assert schema["parameters"]["properties"]["line"]["type"] == ["integer", "null"]
 
 
+def test_prompt_guides_contextual_security_review_and_safe_recommendations():
+    prompt = prompts.SYSTEM_PROMPT
+    assert "empty runtime dependency file is valid" in prompt
+    assert "workflow_dispatch-only workflow may be intentional" in prompt
+    assert "do not mark the category reviewed" in prompt
+    assert "dynamic SQL" in prompt
+    assert "unsafe deserialization" in prompt
+    assert "Never recommend printing" in prompt
+    assert "echoing or logging secrets" in prompt
+
+
 def test_coverage_nudge_before_finishing(sample_repo):
     llm = ScriptedLLM([[call("finish_audit")], [call("finish_audit")]])
     agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(self_review=False))
