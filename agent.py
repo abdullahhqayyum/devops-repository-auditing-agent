@@ -39,7 +39,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--provider",
         default=None,
-        choices=["anthropic", "openai", "gemini", "ollama"],
+        choices=["anthropic", "openai", "gemini", "openrouter", "ollama"],
         help="LLM provider (default: env LLM_PROVIDER or auto)",
     )
     p.add_argument("--model", default=None, help="Model name (default: env LLM_MODEL or provider default)")
