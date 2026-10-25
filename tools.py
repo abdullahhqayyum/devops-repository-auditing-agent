@@ -395,16 +395,19 @@ class RepoTools:
 
     def scan_secrets(self, path: str | None = None) -> str:
         """Heuristic credential scan over tracked text files. Values are always redacted."""
-        prefix = (self.normalize_path(path) or "") if path else ""
+        scope = self._safe_path(self.normalize_path(path) or ".") if path else self.root
+        prefix = scope.relative_to(self.root).as_posix()
+        if prefix == ".":
+            prefix = ""
         results: list[str] = []
         placeholder_count = 0
         for f in self.tracked_files():
-            if prefix and not f.startswith(prefix):
+            if prefix and f != prefix and not f.startswith(prefix + "/"):
                 continue
             if any(f.lower().endswith(s) for s in SKIP_SECRET_SCAN_SUFFIXES):
                 continue
-            target = self.root / f
             try:
+                target = self._safe_path(f)
                 if not target.is_file() or target.stat().st_size > MAX_FILE_BYTES:
                     continue
                 text = self._read_text(target)
