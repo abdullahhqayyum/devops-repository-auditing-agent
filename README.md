@@ -6,8 +6,7 @@ model chooses itself**, and writes an evidence-based JSON report of DevOps best-
 Assignment 2 of *MLOps & Production AI Engineering*. Repository: <https://github.com/abdullahhqayyum/devops-repository-auditing-agent>
 
 * The agent loop, tool dispatch and control flow are hand-written Python (`agent_loop.py`). No agent framework
-  (LangChain, LangGraph, n8n, ...) is used; the model call goes through plain provider SDKs (`anthropic`, `openai`)
-  or plain HTTP (Ollama). Gemini and OpenRouter are reached through their OpenAI-compatible endpoints.
+  (LangChain, LangGraph, n8n, ...) is used; OpenRouter is called through the OpenAI-compatible Python SDK.
 * The model decides which tool to call next from what it has seen. There is no fixed checklist and no static scanner whose
   output is merely summarised.
 * The audited repository is never modified and its code is never executed.
@@ -17,7 +16,7 @@ Assignment 2 of *MLOps & Production AI Engineering*. Repository: <https://github
 ## 1. Requirements and installation
 
 Requirements: **Python 3.10 or newer** and **`git` on `PATH`**. Dependencies are pinned in `requirements.txt`
-(`anthropic`, `openai`, `PyYAML`, `python-dotenv`, `ruff`, `pytest`); `pyproject.toml` declares compatible ranges.
+(`openai`, `PyYAML`, `python-dotenv`, `ruff`, `pytest`); `pyproject.toml` declares compatible ranges.
 
 ```bash
 git clone https://github.com/abdullahhqayyum/devops-repository-auditing-agent
@@ -42,62 +41,43 @@ Activation is convenient but not required: the agent finds `ruff` through the Py
 cp .env.example .env                # Windows: copy .env.example .env
 ```
 
-Edit `.env` and set **one** provider key. `.env` is git-ignored; never commit it. Variables already exported in your shell
-take precedence over `.env`.
+Edit `.env` and set `OPENROUTER_API_KEY`. The evaluator must supply an OpenRouter key to run this version; a key for another
+service will not authenticate it. `.env` is git-ignored; never commit it. Variables already exported in your shell take
+precedence over `.env`.
 
 | Variable | Meaning |
 |---|---|
-| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) / `OPENROUTER_API_KEY` | Credentials for the provider you use (one is enough) |
-| `LLM_PROVIDER` | `anthropic`, `openai`, `gemini`, `openrouter` or `ollama`. Optional for cloud providers (detected from the key) |
-| `LLM_MODEL` | Optional model override |
-| `OPENAI_BASE_URL` | Optional OpenAI-compatible endpoint (used with `LLM_PROVIDER=openai`) |
-| `LLM_MIN_SECONDS_BETWEEN_CALLS` | Minimum gap between model requests. Default 6.5 s for Gemini (free-tier friendly), 3.5 s for OpenRouter, 0 otherwise. Raise it (for example 13) if you see per-minute rate limits |
-| `OLLAMA_HOST`, `OLLAMA_NUM_CTX` | Local Ollama server (default `http://localhost:11434`) and context window (default 32768) |
+| `OPENROUTER_API_KEY` | Required OpenRouter credential |
+| `LLM_MODEL` | Optional OpenRouter model slug; defaults to `openrouter/free` |
+| `LLM_MIN_SECONDS_BETWEEN_CALLS` | Optional minimum gap between requests; defaults to 3.5 s |
 
-### Provider and model selection
-
-1. **Provider**: `--provider`, else `LLM_PROVIDER`, else detected from the keys present (Anthropic, then OpenAI, then Gemini,
-   then OpenRouter, when several are set). Ollama must be selected explicitly.
-2. **Model**: `--model`, else `LLM_MODEL`, else the provider default below. Only a *default* model falls back to the next
-   known name when the provider reports it missing (HTTP 404); an explicitly chosen model is never swapped.
-
-| Provider | Default model | Notes |
-|---|---|---|
-| Gemini | `gemini-3.6-flash` | OpenAI-compatible endpoint; **the only provider exercised live so far** |
-| Anthropic | `claude-sonnet-5-5` | Messages API with native tool use (covered by mocked tests only) |
-| OpenAI | `gpt-4.1` | Chat Completions; also any OpenAI-compatible server (covered by mocked tests only) |
-| OpenRouter | `openrouter/free` | One key, many models, through the OpenAI-compatible adapter. Needs a **tool-capable** model; see below (mocked tests; one live smoke attempt only partly succeeded, see below) |
-| Ollama | `qwen3:8b` | Local, no key. Needs `ollama serve` and a tool-calling model you pulled |
-
-The grade does not depend on the provider; any one of them works with the same command.
+`--model` overrides `LLM_MODEL`; otherwise the agent uses `openrouter/free`. The optional `--provider openrouter` flag remains
+accepted for existing commands. Old provider keys and `LLM_PROVIDER` never select an API. If an inherited `LLM_PROVIDER`
+names a different provider, its `LLM_MODEL` value is ignored unless you explicitly pass `--model`.
 
 ### Using OpenRouter
 
-OpenRouter gives one API key access to many hosted models. It is a first-class provider (`openrouter`) that reuses the
-OpenAI-compatible adapter, the same agent loop and the same retry, redaction and trace code as the other providers.
+OpenRouter gives one API key access to many hosted models. The client uses its OpenAI-compatible endpoint; the investigation
+loop, tool dispatch, retry handling and trace remain hand-written in this repository.
 
 ```bash
 # .env (never commit it)
 OPENROUTER_API_KEY=<your key from https://openrouter.ai/keys>
-LLM_PROVIDER=openrouter
-LLM_MODEL=openrouter/free          # or a pinned slug, see below
 
-python agent.py --repo https://github.com/<owner>/<repo> --output report.json --provider openrouter --model openrouter/free
+python agent.py --repo https://github.com/<owner>/<repo> --output report.json
+# Optional: --model cohere/north-mini-code:free
 ```
 
-* **Credentials and endpoint.** The key is read from `OPENROUTER_API_KEY` (never from `OPENAI_API_KEY`); the endpoint is
+* **Credentials and endpoint.** The key is read from `OPENROUTER_API_KEY`; the endpoint is
   `https://openrouter.ai/api/v1`.
-* **Models.** `--model` or `LLM_MODEL` takes an OpenRouter slug such as `nvidia/nemotron-3-super-120b-a12b:free`. Slugs are
+* **Models.** `--model` or `LLM_MODEL` takes an OpenRouter slug such as `cohere/north-mini-code:free`. Slugs are
   passed through verbatim and are never swapped for another model, because a silent swap could land on a paid one.
 * **The agent requires tool calling.** A model without it fails with a clear message (OpenRouter answers
   "No endpoints found that support tool use"); pick a model whose `supported_parameters` include `tools`
   (<https://openrouter.ai/api/v1/models> lists them).
 * **`openrouter/free` versus a pinned model.** `openrouter/free` routes among free models that support the features of the
-  request, so it may pick a different model on each call. That is convenient for a smoke test but unsuitable for comparing
-  detection quality. For reproducible runs pin one slug. When this was written, the public catalog listed these free,
-  tool-capable models with a 256k context: `nvidia/nemotron-3-super-120b-a12b:free`, `google/gemma-4-31b-it:free` and
-  `cohere/north-mini-code:free`. Free models can be withdrawn, so check the catalog; whether any of them performs well on this
-  agent has **not been measured here**.
+  request, so it may pick a different model on each call. Pin a current tool-capable slug for reproducible runs. Free models
+  can be withdrawn, so check the catalog before using a pinned slug.
 * **Free-tier limits and cost.** Free (`:free`) models are documented at 20 requests per minute and 50 per day for accounts
   with under 10 credits purchased, shared across all free models (confirm on OpenRouter's limits page). A negative credit
   balance can return HTTP 402 even for free models. Paid models are billed per token; the agent never selects one unless you
@@ -109,14 +89,8 @@ python agent.py --repo https://github.com/<owner>/<repo> --output report.json --
   models behind the router have different context windows.
 * **Checking your free quota.** `GET https://openrouter.ai/api/v1/key` with your key as a bearer token reports spend and
   `free_model_daily_requests` (`used`, `limit`, `remaining`).
-* **Live status.** One real run against `octocat/Hello-World` with `google/gemma-4-31b-it:free` authenticated, was accepted
-  with our tool schemas, and the model chose `list_files` by itself, but the run did **not complete**: OpenRouter then
-  answered HTTP 429 "temporarily rate-limited upstream" for that model, and the agent stopped after its bounded retries
-  (exit 4, labeled partial output). That limit is the upstream provider's shared free capacity for one model, separate from
-  your account quota (the account showed 0 of 50 free requests used and no spend). A pinned free model can therefore be
-  throttled for a while; `openrouter/free` routes among several free models and may avoid that, at the cost of
-  reproducibility. That run was not repeated. A later healthy-fixture audit with `openrouter/free` completed; see the
-  evaluation results below.
+* **Live evaluations.** Earlier Gemini and OpenRouter runs, including the incomplete pinned-model smoke test, are historical
+  results from before this cleanup. Their outcomes and limitations are recorded in Section 9.
 
 ## 3. Running
 
@@ -130,10 +104,11 @@ accepted or rejected finding, and why the run stopped).
 | Option | Default | Purpose |
 |---|---|---|
 | `--trace PATH` / `--trace none` | `<output>.trace.json` | Trace location, or disable |
-| `--provider`, `--model` | from env | Override provider and model |
+| `--provider openrouter` | OpenRouter | Optional compatibility flag; other providers are unsupported |
+| `--model SLUG` | `LLM_MODEL` or `openrouter/free` | Choose an OpenRouter model |
 | `--max-steps` | 45 | Model turns for the investigation (a short wrap-up follows) |
 | `--max-tool-calls` | 120 | Inspection tool executions (a short wrap-up follows) |
-| `--timeout` | 1500 (3600 for Ollama) | Wall-clock budget in seconds. Running out ends the audit as **incomplete** |
+| `--timeout` | 1500 | Wall-clock budget in seconds. Running out ends the audit as **incomplete** |
 | `--sandbox docker` | off | Offers the `run_tests` tool, run inside a locked-down container |
 | `--allow-local` | off | Accept a local git path as `--repo` (evaluation and development only) |
 | `-v` | off | Progress log on stderr |
@@ -175,16 +150,17 @@ The trace of an incomplete run records `"status": "incomplete"` and the stop rea
 example "no tests at all"). Secret values are never reproduced. Every report is validated against this contract before it
 is written (`report.validate_report`).
 
-`sample_report.json` is a real output of the agent: a completed audit of `https://github.com/octocat/Hello-World`
-(a one-file repository, so the violations list is genuinely empty). `sample_report.trace.json` is that run's trace. It was
-recorded before the Ruff-detection fix described below, so its `run_ruff` call honestly reports Ruff as unavailable.
+`sample_report.json` is an authentic historical output from a Gemini `gemini-3.6-flash` audit of
+`https://github.com/octocat/Hello-World` (a one-file repository, so the violations list is genuinely empty).
+`sample_report.trace.json` is that run's trace. Neither artifact was regenerated for the OpenRouter-only refactor. They
+predate the Ruff-detection fix described below, so the trace's `run_ruff` call honestly reports Ruff as unavailable.
 
 ## 5. Architecture
 
 ```
 agent.py          CLI: validate input, build the LLM client, clone read-only, run the agent, validate and write JSON
 agent_loop.py     The agent: message history, turn loop, tool dispatch, budgets, coverage and self-review nudges, trace
-llm_client.py     Provider adapters (Anthropic, OpenAI-compatible incl. Gemini and OpenRouter, Ollama), retries, quota handling, deadline
+llm_client.py     OpenRouter adapter, normalized LLM messages, retries, quota handling, deadline
 tools.py          Read-only inspection tools, their JSON schemas, argument validation and dispatch
 prompts.py        System prompt, rule catalog, severity guide, agent-control tools
 report.py         Finding validation (evidence grounding), de-duplication, contract check, atomic write
@@ -238,14 +214,13 @@ libraries may use ranges, no inference about remote branch protection).
 
 ## 6. Retry, quota and time-budget handling
 
-* The SDK clients are created with `max_retries=0`; `llm_client._retrying` is the only retry layer.
+* The OpenAI-compatible SDK client is created with `max_retries=0`; `llm_client._retrying` is the only retry layer.
 * **HTTP 429** gets at most 3 attempts. A server hint (`Retry-After`, `retry-after-ms`, a `RetryInfo` delay, or "retry in N s"
   text) is honoured up to 60 s; a longer one ends the run. Without a hint the wait is exponential (5 s, 10 s).
 * A 429 that identifies a **daily** quota window (`quotaId` containing `PerDay` or `Daily`, wording that names a per-day
-  limit) or OpenAI's `insufficient_quota` stops at once: waiting seconds cannot clear it. Generic "check your billing"
+  limit) or a structured `insufficient_quota` code stops at once: waiting seconds cannot clear it. Generic "check your billing"
   text is not treated as exhaustion, because per-minute limits use it too.
-* **Timeouts, connection errors and 5xx** get up to 6 attempts with exponential backoff (3, 6, 12, 24, 48 s). Ollama keeps
-  its own 3 attempts.
+* **Timeouts, connection errors and 5xx** get up to 6 attempts with exponential backoff (3, 6, 12, 24, 48 s).
 * The agent gives the adapter an absolute deadline derived from `--timeout`. Retry sleeps, request spacing and each request's
   timeout respect it. SDK timeouts apply per phase (connect, read, write) rather than to the whole request, so a stalled
   network can still overrun the deadline slightly.
@@ -273,8 +248,8 @@ python -m ruff check .
 python -m ruff format --check .
 ```
 
-The suite needs no network and no API key. It covers each tool (including path-traversal protection and malformed
-arguments), redaction, the finding validator and JSON contract, the provider message converters, the OpenRouter integration, the retry, quota and
+The suite needs no network or real API key. It covers each tool (including path-traversal protection and malformed
+arguments), redaction, the finding validator and JSON contract, OpenRouter message conversion, the retry, quota and
 deadline logic, the agent loop driven by a scripted fake model (dynamic follow-up, batched calls, rejection of ungrounded
 findings, coverage nudge, budgets, incomplete runs), the CLI end to end, and the evaluation scorer. **No test calls a real
 model API.** CI (`.github/workflows/ci.yml`) runs lint, format check and tests on Python 3.10 and 3.12.
@@ -319,7 +294,7 @@ duplicate of an already matched defect. Known defects nobody reported are **fals
 
 ### Results that have actually been obtained
 
-The first four runs used Gemini `gemini-3.6-flash`; the last two used OpenRouter. The fixtures are
+These runs predate the OpenRouter-only refactor. The first four used Gemini `gemini-3.6-flash`; the last two used OpenRouter. The fixtures are
 the author's own and were written alongside the rule catalog, so they measure whether the machinery works, not performance
 on unseen repositories. Scores from different models are not comparable with one another.
 
@@ -352,13 +327,15 @@ live model.**
 
 ## 10. Known limitations
 
-* Gemini and the OpenRouter free router have completed live audits. Anthropic, OpenAI and Ollama are covered by mocked
-  tests. The OpenRouter healthy run used six routed models, so it does not measure full-audit behaviour of any one pinned
-  free model. Free models can be throttled or withdrawn at any time.
+* The current integration requires `OPENROUTER_API_KEY`. The assignment lets the evaluator configure supplied credentials
+  but does not name their provider; a non-OpenRouter key alone cannot run this version.
+* Gemini and the OpenRouter free router completed live audits before this refactor. The OpenRouter healthy run used six
+  routed models, so it does not measure full-audit behaviour of any one pinned free model. Free models can be throttled or
+  withdrawn at any time. The refactor itself was checked with mocked responses, not a new live audit.
 * Detection quality has been measured on the author's own fixtures: Gemini on the defective fixture and the OpenRouter
   free router on the healthy fixture. Behaviour and false-positive rates on unseen repositories remain unmeasured.
-* Gemini's free tier has per-minute and per-day request limits. The agent stops cleanly when the daily limit is hit
-  (exit 4, labeled partial output) but cannot work around it.
+* OpenRouter's free tier has per-minute and per-day request limits. The agent stops cleanly when an identified daily limit
+  is hit (exit 4, labeled partial output) but cannot work around it.
 * Redaction is heuristic. Unquoted YAML values are redacted only under secret-named keys and only when they contain a digit
   or a symbol; plain-word passwords, multi-word values, Kubernetes `name`/`value` pairs and flow mappings are not detected.
 * The wall-clock deadline cannot interrupt a request that is already in flight beyond its own phase timeouts.
