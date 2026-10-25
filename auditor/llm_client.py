@@ -67,6 +67,10 @@ class LLMResponse:
     stop_reason: str | None = None
     input_tokens: int = 0
     output_tokens: int = 0
+    request_duration_seconds: float | None = None
+    retry_count: int | None = None
+    throttle_wait_seconds: float | None = None
+    model: str | None = None
 
 
 class LLM(Protocol):
@@ -271,7 +275,7 @@ def _delay(info: _ErrorInfo, attempt: int) -> float:
     return min(MAX_BACKOFF, base * 2 ** (attempt - 1)) + random.uniform(0, 1.5)
 
 
-def _retrying(call, attempts: int = TRANSIENT_ATTEMPTS, deadline: float | None = None):
+def _retrying(call, attempts: int = TRANSIENT_ATTEMPTS, deadline: float | None = None, stats: dict[str, Any] | None = None):
     """Run ``call``, retrying failures worth retrying.
 
     * Rate limits (HTTP 429) get at most RATE_LIMIT_ATTEMPTS attempts; timeouts, connection errors and 5xx get ``attempts``.
@@ -310,6 +314,8 @@ def _retrying(call, attempts: int = TRANSIENT_ATTEMPTS, deadline: float | None =
                     f"this agent will wait. Provider said: {_safe_message(exc, 300)}"
                 ) from exc
             delay = _delay(info, attempt)
+            if stats is not None:
+                stats["count"] = stats.get("count", 0) + 1
             if deadline is not None and time.monotonic() + delay >= deadline:
                 log.error("LLM retry in %.1fs would pass the wall-clock budget; stopping (%s)", delay, _describe(info))
                 raise LLMBudgetExhausted(
@@ -374,14 +380,17 @@ class _Throttle:
         self.min_interval = max(0.0, min_interval)
         self._last = 0.0
 
-    def wait(self, deadline: float | None = None) -> None:
+    def wait(self, deadline: float | None = None) -> float:
         gap = time.monotonic() - self._last
+        waited = 0.0
         if self._last and gap < self.min_interval:
             pause = self.min_interval - gap
             if deadline is not None and time.monotonic() + pause >= deadline:
                 raise LLMBudgetExhausted("wall-clock budget exhausted while waiting between model requests")
             time.sleep(pause)
+            waited = pause
         self._last = time.monotonic()
+        return waited
 
 
 class OpenRouterLLM(_Budgeted):
@@ -436,8 +445,10 @@ class OpenRouterLLM(_Budgeted):
 
         token_param = {"max_tokens": self.max_tokens}
 
+        retry_stats = {"count": 0, "throttle_wait": 0.0}
+
         def call():
-            self.throttle.wait(self.deadline)
+            retry_stats["throttle_wait"] += self.throttle.wait(self.deadline)
             timeout = self._request_timeout()
             try:
                 resp = self.client.chat.completions.create(
@@ -457,7 +468,8 @@ class OpenRouterLLM(_Budgeted):
                     return call()
                 raise
 
-        resp = _retrying(call, deadline=self.deadline)
+        started = time.monotonic()
+        resp = _retrying(call, deadline=self.deadline, stats=retry_stats)
         choice = resp.choices[0]
         calls = []
         for tc in choice.message.tool_calls or []:
@@ -479,6 +491,10 @@ class OpenRouterLLM(_Budgeted):
             choice.finish_reason,
             getattr(usage, "prompt_tokens", 0) or 0,
             getattr(usage, "completion_tokens", 0) or 0,
+            request_duration_seconds=round(time.monotonic() - started, 3),
+            retry_count=retry_stats["count"],
+            throttle_wait_seconds=round(retry_stats["throttle_wait"], 3),
+            model=self.model,
         )
 
 

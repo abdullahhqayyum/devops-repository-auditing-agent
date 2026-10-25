@@ -115,7 +115,11 @@ class AuditAgent:
                 wrapup_left -= 1
 
             step += 1
-            self._trim_context()
+            compacted = self._trim_context()
+            system_chars = len(prompts.SYSTEM_PROMPT)
+            schema_chars = len(json.dumps(all_tools, separators=(",", ":"), ensure_ascii=False))
+            history_chars = len(json.dumps(self.messages, separators=(",", ":"), ensure_ascii=False))
+            request_started = time.monotonic()
             try:
                 response = self.llm.chat(prompts.SYSTEM_PROMPT, self.messages, all_tools)
             except LLMBudgetExhausted as exc:
@@ -141,8 +145,19 @@ class AuditAgent:
                     ],
                 }
             )
+            tool_result_chars = 0
 
             if not response.tool_calls:
+                self._trace_llm_telemetry(
+                    step,
+                    response,
+                    system_chars,
+                    schema_chars,
+                    history_chars,
+                    request_started,
+                    compacted,
+                    tool_result_chars,
+                )
                 idle_turns += 1
                 if idle_turns >= 3:
                     log.warning("Model stopped calling tools; finalizing")
@@ -158,7 +173,18 @@ class AuditAgent:
                     result = f"ERROR: {call.parse_error}"
                 else:
                     result = self._execute(call.name, call.arguments) or "(empty output)"
+                tool_result_chars += len(result)
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": result})
+            self._trace_llm_telemetry(
+                step,
+                response,
+                system_chars,
+                schema_chars,
+                history_chars,
+                request_started,
+                compacted,
+                tool_result_chars,
+            )
 
         self._trace_finished(step)
         return self.store.as_report_list()
@@ -172,6 +198,39 @@ class AuditAgent:
             tokens=self.tokens,
             steps=step,
             stop_reason=self.stop_reason,
+        )
+
+    def _trace_llm_telemetry(
+        self,
+        step: int,
+        response: LLMResponse,
+        system_chars: int,
+        schema_chars: int,
+        history_chars: int,
+        request_started: float,
+        compacted: bool,
+        tool_result_chars: int,
+    ) -> None:
+        self.trace.add(
+            "llm_telemetry",
+            step=step,
+            model=response.model or getattr(self.llm, "model", None),
+            system_prompt_chars=system_chars,
+            tool_schema_chars=schema_chars,
+            conversation_history_chars=history_chars,
+            approximate_request_chars=system_chars + schema_chars + history_chars,
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
+            tool_call_count=len(response.tool_calls),
+            tool_result_chars=tool_result_chars,
+            request_duration_seconds=(
+                response.request_duration_seconds
+                if response.request_duration_seconds is not None
+                else round(time.monotonic() - request_started, 3)
+            ),
+            retry_count=response.retry_count,
+            throttle_wait_seconds=response.throttle_wait_seconds,
+            context_compacted=compacted,
         )
 
     def _abort(self, step: int, reason: str, exc: LLMError) -> NoReturn:
@@ -264,17 +323,20 @@ class AuditAgent:
         self.tokens["input"] += response.input_tokens
         self.tokens["output"] += response.output_tokens
 
-    def _trim_context(self) -> None:
+    def _trim_context(self) -> bool:
         """Elide old tool outputs when the conversation grows too large (pairing stays intact)."""
         size = sum(len(m.get("content") or "") for m in self.messages)
         if size <= self.config.context_char_budget:
-            return
+            return False
+        compacted = False
         tool_idx = [i for i, m in enumerate(self.messages) if m["role"] == "tool"]
         for i in tool_idx[: max(0, len(tool_idx) - self.config.keep_recent_tool_results)]:
             content = self.messages[i]["content"]
             if len(content) > 300 and not content.startswith("[elided"):
                 self.messages[i]["content"] = "[elided to save context; first 200 chars] " + content[:200]
+                compacted = True
                 size -= len(content) - 250
                 if size <= self.config.context_char_budget * 0.7:
                     break
         self.trace.add("control", message="context trimmed", approx_chars=size)
+        return compacted
