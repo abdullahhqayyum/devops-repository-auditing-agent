@@ -221,6 +221,13 @@ def test_multiple_tool_calls_in_one_turn_are_parsed_in_order_with_their_ids(env)
     assert (response.input_tokens, response.output_tokens) == (120, 15)
 
 
+def test_missing_usage_metadata_is_null(env):
+    message = SimpleNamespace(content="ok", tool_calls=None)
+    response = SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")], usage=None)
+    result = make_llm(env, Completions(response)).chat("s", USER, TOOLS)
+    assert result.input_tokens is None and result.output_tokens is None
+
+
 def test_request_telemetry_reports_retries_throttle_and_model(env, clock):
     completions = Completions(http_error(503), completion("done"))
     llm = make_llm(env, completions)

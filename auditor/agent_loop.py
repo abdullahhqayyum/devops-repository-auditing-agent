@@ -30,6 +30,7 @@ class AuditConfig:
     keep_recent_tool_results: int = 12
     wall_clock_seconds: int = 1500  # exceeding it ends the run as incomplete (LLMBudgetExhausted), with no wrap-up
     self_review: bool = True
+    cache_inspection_results: bool = True
 
 
 @dataclass
@@ -51,6 +52,20 @@ class Trace:
 
 
 class AuditAgent:
+    _CACHEABLE_INSPECTION_TOOLS = frozenset(
+        {
+            "list_files",
+            "read_file",
+            "search_code",
+            "git_log",
+            "git_show_commit",
+            "inspect_tracked_artifacts",
+            "inspect_workflows",
+            "scan_secrets",
+            "run_ruff",
+        }
+    )
+
     def __init__(self, llm: LLM, tools: RepoTools, repo_url: str, config: AuditConfig | None = None) -> None:
         self.llm = llm
         self.tools = tools
@@ -67,6 +82,7 @@ class AuditAgent:
         self._coverage_nudged = False
         self._self_reviewed = False
         self.tokens = {"input": 0, "output": 0}
+        self._inspection_cache: dict[str, str] = {}
 
     # ---------------------------------------------------------------- overview
     def _overview(self) -> str:
@@ -287,8 +303,34 @@ class AuditAgent:
 
         # Inspection tool.
         self.inspection_calls += 1
+        cache_key = json.dumps({"name": name, "arguments": args}, sort_keys=True, separators=(",", ":"))
+        cached = (
+            self._inspection_cache.get(cache_key)
+            if self.config.cache_inspection_results and name in self._CACHEABLE_INSPECTION_TOOLS
+            else None
+        )
+        if cached is not None and any(
+            message.get("role") == "tool"
+            and message.get("content") == cached
+            and not str(message.get("content", "")).startswith("[elided")
+            for message in self.messages
+        ):
+            result = "Cached result from an identical earlier inspection; use that earlier tool result as evidence."
+            result = redact(result)
+            self.trace.add(
+                "tool_call",
+                name=name,
+                arguments=args,
+                duration=round(time.time() - started, 2),
+                output_chars=len(result),
+                output_preview=result[:400],
+                cache_hit=True,
+            )
+            return result
         result = dispatch(self.tools, name, args)
         result = redact(result)
+        if self.config.cache_inspection_results and name in self._CACHEABLE_INSPECTION_TOOLS:
+            self._inspection_cache[cache_key] = result
         self.trace.add(
             "tool_call",
             name=name,
@@ -296,6 +338,7 @@ class AuditAgent:
             duration=round(time.time() - started, 2),
             output_chars=len(result),
             output_preview=result[:400],
+            cache_hit=False,
         )
         log.info("tool %s(%s) -> %d chars", name, json.dumps(args)[:120], len(result))
         return result
@@ -320,8 +363,10 @@ class AuditAgent:
 
     # ----------------------------------------------------------------- context
     def _account(self, response: LLMResponse) -> None:
-        self.tokens["input"] += response.input_tokens
-        self.tokens["output"] += response.output_tokens
+        if response.input_tokens is not None:
+            self.tokens["input"] += response.input_tokens
+        if response.output_tokens is not None:
+            self.tokens["output"] += response.output_tokens
 
     def _trim_context(self) -> bool:
         """Elide old tool outputs when the conversation grows too large (pairing stays intact)."""

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ class BenchmarkResult:
     turns: int
     request_chars: int
     inspection_calls: int
+    tool_output_chars: int
     findings: int
     completed: bool
     evidence_valid: bool
@@ -66,19 +68,33 @@ def _mark_all(start: int) -> list[ToolCall]:
     ]
 
 
-def _run(repo: Path, turns: list[list[ToolCall]], name: str) -> tuple[BenchmarkResult, ScriptedBenchmarkLLM]:
+def _run(
+    repo: Path, turns: list[list[ToolCall]], name: str, cache_inspection_results: bool = True
+) -> tuple[BenchmarkResult, ScriptedBenchmarkLLM]:
     llm = ScriptedBenchmarkLLM(turns)
-    agent = AuditAgent(llm, RepoTools(repo), str(repo), AuditConfig(self_review=False))
+    config_kwargs = {"self_review": False}
+    if "cache_inspection_results" in {item.name for item in fields(AuditConfig)}:
+        config_kwargs["cache_inspection_results"] = cache_inspection_results
+    agent = AuditAgent(llm, RepoTools(repo), str(repo), AuditConfig(**config_kwargs))
     findings = agent.run()
     telemetry = [event for event in agent.trace.events if event["type"] == "llm_telemetry"]
-    request_chars = sum(event["approximate_request_chars"] for event in telemetry)
+    schema_chars = len(
+        json.dumps(tool_schemas(RepoTools(repo)) + prompts.AGENT_TOOL_SCHEMAS, separators=(",", ":"), ensure_ascii=False)
+    )
+    request_chars = (
+        sum(event["approximate_request_chars"] for event in telemetry)
+        if telemetry
+        else sum(len(prompts.SYSTEM_PROMPT) + schema_chars + _serialized_size(messages) for messages in llm.requests)
+    )
+    tool_events = [event for event in agent.trace.events if event["type"] == "tool_call"]
     evidence_valid = all(item.get("evidence") and item.get("file") in agent.tools.observed_files for item in findings)
     return (
         BenchmarkResult(
             name,
-            len(telemetry),
+            len(telemetry) or len(llm.requests),
             request_chars,
             agent.inspection_calls,
+            sum(event.get("tool_result_chars", event.get("output_chars", 0)) for event in tool_events),
             len(findings),
             agent.finished,
             evidence_valid,
@@ -150,10 +166,10 @@ def _duplicate_turns(defective: bool) -> list[list[ToolCall]]:
 
 
 def _print(results: list[BenchmarkResult]) -> None:
-    print("strategy                 turns  request_chars  inspections  findings  complete  evidence")
+    print("strategy                 turns  request_chars  inspections  tool_chars  findings  complete  evidence")
     for result in results:
         print(
-            f"{result.name:24} {result.turns:>5} {result.request_chars:>14} {result.inspection_calls:>12} "
+            f"{result.name:24} {result.turns:>5} {result.request_chars:>14} {result.inspection_calls:>12} {result.tool_output_chars:>10} "
             f"{result.findings:>9} {str(result.completed):>9} {str(result.evidence_valid):>8}"
         )
     print("\nNo network calls were made; provider token counts are unavailable for this benchmark.")
@@ -171,28 +187,15 @@ def main() -> int:
         results: list[BenchmarkResult] = []
         for fixture, defective in (("healthy", False), ("defective", True)):
             repo = fixture_root / fixture
-            baseline, baseline_llm = _run(repo, _make_turns(defective), f"{fixture}:baseline")
-            baseline.request_chars = sum(
-                len(prompts.SYSTEM_PROMPT)
-                + len(
-                    json.dumps(
-                        tool_schemas(RepoTools(repo)) + prompts.AGENT_TOOL_SCHEMAS,
-                        separators=(",", ":"),
-                        ensure_ascii=False,
-                    )
-                )
-                + _serialized_size(messages)
-                for messages in baseline_llm.requests
-            )
+            baseline, baseline_llm = _run(repo, _duplicate_turns(defective), f"{fixture}:main-baseline", False)
             results.append(baseline)
             compact, compact_llm = _run(repo, _make_turns(defective), f"{fixture}:compact")
             compact.request_chars = _simulate_compaction(compact_llm.requests, repo, keep_recent=2, excerpt=240)
             compact.risks = "old evidence is summarized"
             results.append(compact)
-            duplicate, _ = _run(repo, _duplicate_turns(defective), f"{fixture}:dedupe-simulated")
-            duplicate.inspection_calls -= 1
-            duplicate.risks = "only deterministic read-only calls are cacheable"
-            results.append(duplicate)
+            optimized, _ = _run(repo, _duplicate_turns(defective), f"{fixture}:optimized-cache")
+            optimized.risks = "only deterministic read-only calls are cacheable"
+            results.append(optimized)
             batched, _ = _run(repo, _make_turns(defective, batched=True), f"{fixture}:batched")
             batched.risks = "dependent calls must not be batched"
             results.append(batched)

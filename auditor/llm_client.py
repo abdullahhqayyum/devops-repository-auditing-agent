@@ -65,8 +65,8 @@ class LLMResponse:
     text: str
     tool_calls: list[ToolCall] = field(default_factory=list)
     stop_reason: str | None = None
-    input_tokens: int = 0
-    output_tokens: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
     request_duration_seconds: float | None = None
     retry_count: int | None = None
     throttle_wait_seconds: float | None = None
@@ -489,8 +489,8 @@ class OpenRouterLLM(_Budgeted):
             (choice.message.content or "").strip(),
             calls,
             choice.finish_reason,
-            getattr(usage, "prompt_tokens", 0) or 0,
-            getattr(usage, "completion_tokens", 0) or 0,
+            getattr(usage, "prompt_tokens", None),
+            getattr(usage, "completion_tokens", None),
             request_duration_seconds=round(time.monotonic() - started, 3),
             retry_count=retry_stats["count"],
             throttle_wait_seconds=round(retry_stats["throttle_wait"], 3),

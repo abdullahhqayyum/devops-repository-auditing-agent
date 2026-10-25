@@ -85,3 +85,24 @@ def test_missing_provider_metadata_is_null_and_trace_contains_no_raw_content(sam
     assert secret not in serialized
     assert prompts.SYSTEM_PROMPT not in serialized
     assert "conversation_history_chars" in serialized
+
+
+def test_duplicate_read_only_inspection_reuses_prior_result(sample_repo):
+    from fakes import ScriptedLLM, call
+
+    llm = ScriptedLLM(
+        [
+            [call("list_files")],
+            [call("list_files")],
+            _mark_all(),
+            [call("finish_audit")],
+        ]
+    )
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(self_review=False))
+    agent.run()
+
+    calls = [event for event in agent.trace.events if event["type"] == "tool_call" and event["name"] == "list_files"]
+    assert len(calls) == 2
+    assert calls[0]["cache_hit"] is False
+    assert calls[1]["cache_hit"] is True
+    assert "Cached result" in llm.seen_messages[2][-1]["content"]
