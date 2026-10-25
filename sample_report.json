@@ -1,4 +1,25 @@
 {
-  "repository": "https://github.com/octocat/Hello-World",
-  "violations": []
+  "repository": "https://github.com/example/demo-project",
+  "violations": [
+    {
+      "rule_id": "SEC-006",
+      "category": "security",
+      "severity": "medium",
+      "file": "app/client.py",
+      "line": 18,
+      "description": "HTTPS certificate verification is disabled",
+      "evidence": "The inspected HTTP request passes verify=False, disabling server certificate verification.",
+      "recommendation": "Enable certificate verification; configure a trusted CA bundle if a private certificate authority is required."
+    },
+    {
+      "rule_id": "CI-001",
+      "category": "ci",
+      "severity": "medium",
+      "file": null,
+      "line": null,
+      "description": "No CI configuration validates the application",
+      "evidence": "Tracked-file inspection found application source but no GitHub Actions, GitLab CI, CircleCI, Travis, Jenkins or Azure Pipelines configuration.",
+      "recommendation": "Add CI that runs the existing test and lint commands on pull requests and pushes to the main branch."
+    }
+  ]
 }
