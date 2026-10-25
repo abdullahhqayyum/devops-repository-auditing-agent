@@ -68,8 +68,33 @@ def test_category_alias_and_rule_prefix(store):
 
 def test_retract(store):
     fid = store.add(finding())
-    store.retract(fid, "fixture")
+    store.retract(fid, "SEC-001", "app/config.py", 3, "fixture")
     assert store.as_report_list() == []
+
+
+def test_retract_requires_matching_identity(store):
+    fid = store.add(finding())
+    with pytest.raises(FindingRejected, match="does not match"):
+        store.retract(fid, "HYG-001", "README.md", 1, "wrong target")
+    assert list(store.findings) == [fid]
+    store.retract(fid, "SEC-001", "app/config.py", 3, "correct target")
+    assert store.as_report_list() == []
+
+
+def test_retract_handles_null_identity(store):
+    raw = finding(rule_id="TEST-001", category="testing", severity="medium", file=None, line=None)
+    fid = store.add(raw)
+    store.retract(fid, "TEST-001", None, None, "not applicable")
+    assert store.as_report_list() == []
+
+
+def test_retract_unknown_and_retracted_ids_are_safe(store):
+    with pytest.raises(FindingRejected, match="no active finding"):
+        store.retract("F9", "SEC-001", "app/config.py", 3, "unknown")
+    fid = store.add(finding())
+    store.retract(fid, "SEC-001", "app/config.py", 3, "first")
+    with pytest.raises(FindingRejected, match="no active finding"):
+        store.retract(fid, "SEC-001", "app/config.py", 3, "again")
 
 
 def test_redacts_evidence(store):
