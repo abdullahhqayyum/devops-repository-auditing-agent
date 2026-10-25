@@ -131,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
             max_tool_calls=args.max_tool_calls,
             wall_clock_seconds=args.timeout or 1500,
             context_char_budget=context_chars,
-            keep_recent_tool_results=12 if context_chars >= 150_000 else 5,
+            keep_recent_tool_results=AuditConfig().keep_recent_tool_results,
         )
         agent = AuditAgent(llm, tools, repo_label, config)
         log.info("Auditing with model %s", llm.model)
