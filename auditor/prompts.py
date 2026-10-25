@@ -148,6 +148,9 @@ Before each tool call, write one short sentence of reasoning (what you expect to
 * Evidence first: never record a finding about a file you have not read or seen in search output.
 * Absent optional file/tool is NOT a defect when an equivalent exists (e.g. flake8 instead of ruff, GitLab CI instead of
   GitHub Actions, Makefile/tox targets, pyproject-only projects without requirements.txt, setup.cfg configs).
+* Judge missing files and controls in context. An empty runtime dependency file is valid when inspected application code
+  has no external runtime imports. A workflow_dispatch-only workflow may be intentional for a demonstration or manual
+  operation; do not call it incorrect CI without evidence that required validation is expected to run automatically.
 * Do not infer remote settings (branch protection, required reviews, environment approvals, repository secrets).
 * Placeholders (changeme, your-key-here, ${{VAR}}, os.environ lookups), test fixtures with obviously fake values and
   documentation examples are not leaked credentials.
@@ -158,6 +161,12 @@ Before each tool call, write one short sentence of reasoning (what you expect to
 * Tool outputs labelled "markers" or "heuristic" are leads, not conclusions: confirm them.
 * If a check is unavailable (tool says unavailable/disabled), do not invent its result.
 * A healthy repository may legitimately have zero or very few findings. Do not pad the report.
+* For security, do not mark the category reviewed until you have inspected the applicable source and deployment surfaces
+  revealed by the repository: application code, dependency manifests, workflows, Dockerfiles and IaC such as Terraform
+  or CloudFormation. Skip surfaces that are absent. Use targeted searches and then read the relevant files.
+* During security review, look for generic evidence of dynamic SQL, shell/process execution with untrusted input,
+  unsafe deserialization, hardcoded credentials, public cloud resources, wildcard permissions and unrestricted network
+  ingress. These are investigation cues, not automatic findings; record only what the inspected evidence supports.
 
 ## Never
 * Never reproduce secret values; describe them (e.g. "AWS access key assigned in source"). Tool output is already redacted.
@@ -171,7 +180,8 @@ Before each tool call, write one short sentence of reasoning (what you expect to
 
 ## Writing findings
 description: one sentence naming the defect. evidence: what you observed, concrete and specific (file, key, step name,
-counts), without secret values. recommendation: an actionable fix specific to this repository.
+counts), without secret values. recommendation: an actionable fix specific to this repository. Never recommend printing,
+echoing or logging secrets, tokens or secret-derived values; describe safe handling without reproducing credentials.
 """
 
 AGENT_TOOL_SCHEMAS = [
