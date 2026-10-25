@@ -9,7 +9,8 @@ Assignment 2 of *MLOps*. Repository: <https://github.com/abdullahhqayyum/devops-
   (LangChain, LangGraph, n8n, ...) is used; OpenRouter is called through the OpenAI-compatible Python SDK.
 * The model decides which tool to call next from what it has seen. There is no fixed checklist and no static scanner whose
   output is merely summarised.
-* The audited repository is never modified and its code is never executed.
+* Inspection is read-only and does not execute target code by default. Test execution is available only with the explicit
+  `--sandbox docker` option.
 
 ---
 
@@ -22,10 +23,9 @@ Requirements: **Python 3.10 or newer** and **`git` on `PATH`**. Dependencies are
 git clone https://github.com/abdullahhqayyum/devops-repository-auditing-agent
 cd devops-repository-auditing-agent
 python -m venv .venv
-pip install -r requirements.txt     # after activating the environment, see below
 ```
 
-Activate the virtual environment before installing:
+Activate the virtual environment:
 
 | Shell | Command |
 |---|---|
@@ -33,17 +33,32 @@ Activate the virtual environment before installing:
 | Windows PowerShell | `.venv\Scripts\Activate.ps1` (once per session, if scripts are blocked: `Set-ExecutionPolicy -Scope Process RemoteSigned`) |
 | Windows cmd | `.venv\Scripts\activate.bat` |
 
-Activation is convenient but not required: the agent finds `ruff` through the Python interpreter that runs it.
+Then install dependencies into that environment:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Without activation, use `.venv\Scripts\python.exe` on Windows or `.venv/bin/python` on macOS/Linux for both installation
+and execution. The agent finds `ruff` through the Python interpreter that runs it.
 
 ## 2. Configuration (API credentials)
 
 ```bash
-cp .env.example .env                # Windows: copy .env.example .env
+cp .env.example .env                # macOS / Linux
+```
+
+```powershell
+Copy-Item .env.example .env          # Windows PowerShell; cmd users can use: copy .env.example .env
 ```
 
 Edit `.env` and set `OPENROUTER_API_KEY`. The evaluator must supply an OpenRouter key to run this version; a key for another
 service will not authenticate it. `.env` is git-ignored; never commit it. Variables already exported in your shell take
 precedence over `.env`.
+
+Only `OPENROUTER_API_KEY` must be filled in; leave the optional variables blank to use the defaults. Put the actual key
+in your local `.env`, without angle brackets, and keep `.env.example` credential-free. There is no separate OpenAI key
+requirement. Do not overwrite an existing `.env` when updating the project.
 
 | Variable | Meaning |
 |---|---|
@@ -65,12 +80,12 @@ loop, tool dispatch, retry handling and trace remain hand-written in this reposi
 OPENROUTER_API_KEY=<your key from https://openrouter.ai/keys>
 
 python agent.py --repo https://github.com/<owner>/<repo> --output report.json
-# Optional: --model cohere/north-mini-code:free
+# Optional: append --model followed by a current tool-capable free model slug
 ```
 
 * **Credentials and endpoint.** The key is read from `OPENROUTER_API_KEY`; the endpoint is
   `https://openrouter.ai/api/v1`.
-* **Models.** `--model` or `LLM_MODEL` takes an OpenRouter slug such as `cohere/north-mini-code:free`. Slugs are
+* **Models.** `--model` or `LLM_MODEL` takes an OpenRouter model slug. Slugs are
   passed through verbatim and are never swapped for another model, because a silent swap could land on a paid one.
 * **The agent requires tool calling.** A model without it fails with a clear message (OpenRouter answers
   "No endpoints found that support tool use"); pick a model whose `supported_parameters` include `tools`
@@ -101,9 +116,13 @@ python agent.py --repo https://github.com/<owner>/<repo> --output report.json
 It runs unattended, with no prompts, and writes `report.json` plus `report.trace.json` (every model turn, tool call,
 accepted or rejected finding, and why the run stopped).
 
+Replace `<owner>/<repo>` with the public repository you want to inspect. To verify CLI options without using API quota,
+run `python agent.py --help`. A live audit consumes OpenRouter requests and can take several minutes. A healthy repository
+may produce `"violations": []`; this is valid output, but an empty report alone does not prove the repository is secure.
+
 | Option | Default | Purpose |
 |---|---|---|
-| `--trace PATH` / `--trace none` | `<output>.trace.json` | Trace location, or disable |
+| `--trace PATH` / `--trace none` | `<output-stem>.trace.json` | Trace location, or disable (`report.json` becomes `report.trace.json`) |
 | `--provider openrouter` | OpenRouter | Optional compatibility flag; other providers are unsupported |
 | `--model SLUG` | `LLM_MODEL` or `openrouter/free` | Choose an OpenRouter model |
 | `--max-steps` | 45 | Model turns for the investigation (a short wrap-up follows) |
@@ -111,7 +130,7 @@ accepted or rejected finding, and why the run stopped).
 | `--timeout` | 1500 | Wall-clock budget in seconds. Running out ends the audit as **incomplete** |
 | `--sandbox docker` | off | Offers the `run_tests` tool, run inside a locked-down container |
 | `--allow-local` | off | Accept a local git path as `--repo` (evaluation and development only) |
-| `-v` | off | Progress log on stderr |
+| `-v` / `--verbose` | off | Additional debug logging; normal audit progress already goes to stderr |
 
 ### Exit codes
 
@@ -150,10 +169,15 @@ The trace of an incomplete run records `"status": "incomplete"` and the stop rea
 example "no tests at all"). Secret values are never reproduced. Every report is validated against this contract before it
 is written (`report.validate_report`).
 
-`sample_report.json` is an authentic historical output from a Gemini `gemini-3.6-flash` audit of
-`https://github.com/octocat/Hello-World` (a one-file repository, so the violations list is genuinely empty).
-`docs/sample_report.trace.json` is that run's trace. Neither artifact was regenerated for the OpenRouter-only refactor. They
-predate the Ruff-detection fix described below, so the trace's `run_ruff` call honestly reports Ruff as unavailable.
+[`sample_report.json`](sample_report.json) is a **nonempty illustrative report**, showing a security finding and an absent
+CI configuration. Its repository URL, files, line numbers and findings are fictional examples of the output contract,
+not results of a live audit or a benchmark score. The JSON has exactly the same fields as actual reports.
+
+[`docs/sample_report.json`](docs/sample_report.json) preserves the authentic historical Gemini `gemini-3.6-flash` audit of
+`https://github.com/octocat/Hello-World`, whose violations list is empty. Its matching trace is
+[`docs/sample_report.trace.json`](docs/sample_report.trace.json). These historical artifacts predate the Ruff-detection fix,
+so the trace's `run_ruff` call reports Ruff as unavailable. The helper `scripts/generate_sample_report.sh` performs a live
+audit into this `docs/` pair; it requires credentials and consumes API quota. It does not overwrite the illustrative sample.
 
 ## 5. Architecture
 
@@ -168,15 +192,15 @@ auditor/          Internal package containing the agent loop, OpenRouter client,
 Observe, reason, select tool, execute, interpret, record:
 
 1. The agent shows the model a short overview of the repository (file count, top-level entries, file types).
-2. Each turn the model sees all earlier tool results and returns one or more tool calls. Independent calls are batched in
+2. Each turn the model sees conversation history (subject to context trimming) and returns one or more tool calls. Independent calls are batched in
    one turn; dependent ones are issued after the result they depend on arrives.
 3. The controller executes each call, redacts and truncates the result, and feeds it back.
 4. Findings are tool calls too (`record_finding`). The controller checks that the file is tracked, that the agent actually
    read or searched it during this run, and that the line exists. A rejection is returned to the model with the reason, so
    it gathers evidence and tries again. The model can retract findings (`retract_finding`).
 5. `mark_reviewed` documents which of the nine categories were examined. When the model calls `finish_audit` the controller
-   asks once about unreviewed categories and once for a precision self-review of recorded findings; the model decides what
-   to do and the code never injects findings.
+   asks once about unreviewed categories and, during normal finishing, once for self-review even when no findings were
+   recorded. Self-review is optional in the Python configuration and does not force findings; the model decides what to do.
 6. Budgets: the step and tool-call limits trigger a short wrap-up in which only `record_finding`, `retract_finding` and
    `finish_audit` are honoured, then a normal finish. The wall-clock limit is stricter: it ends the audit as incomplete
    (exit 4) with no wrap-up.
@@ -191,7 +215,7 @@ Observe, reason, select tool, execute, interpret, record:
 | `git_log(max_count?, path?, show_files?)` | Commit history (the clone is shallow, depth 200) |
 | `git_show_commit(commit)` | One commit's patch, for example a secret added and later removed |
 | `inspect_tracked_artifacts()` | Tracked bytecode, virtualenvs, build output, caches, IDE settings, `.env`, keys; files tracked despite `.gitignore` |
-| `scan_secrets(path?)` | Heuristic credential scan; values always redacted, placeholders and fixtures flagged |
+| `scan_secrets(path?)` | Heuristic scan of tracked files; values redacted, obvious placeholders omitted; root, file or directory scope |
 | `inspect_workflows(path?)` | Parsed GitHub Actions workflows: triggers, permissions, jobs, steps and risk *markers*; other CI systems |
 | `run_ruff(path?)` | Static Ruff lint (no code execution) |
 | `run_tests()` | Only with `--sandbox docker`: the test suite in a container |
@@ -247,7 +271,7 @@ The suite needs no network or real API key. It covers each tool (including path-
 arguments), redaction, the finding validator and JSON contract, OpenRouter message conversion, the retry, quota and
 deadline logic, the agent loop driven by a scripted fake model (dynamic follow-up, batched calls, rejection of ungrounded
 findings, coverage nudge, budgets, incomplete runs), the CLI end to end, and the evaluation scorer. **No test calls a real
-model API.** CI (`.github/workflows/ci.yml`) runs lint, format check and tests on Python 3.10 and 3.12.
+model API.** CI (`.github/workflows/ci.yml`) runs lint, format check and tests on Python 3.12.
 
 ## 9. Evaluation fixtures and scoring
 
@@ -295,7 +319,7 @@ on unseen repositories. Scores from different models are not comparable with one
 
 | Run | Status | Outcome |
 |---|---|---|
-| `octocat/Hello-World` (public) | **Complete** | 0 violations (the repository holds one README). 7 model turns, 7 inspection calls, 32,861 input and 611 output tokens. This is `sample_report.json` |
+| `octocat/Hello-World` (public) | **Complete** | 0 violations (the repository holds one README). 7 model turns, 7 inspection calls, 32,861 input and 611 output tokens. Preserved in `docs/sample_report.json` |
 | `defective` fixture, first attempt | **Incomplete** (daily quota) | Stopped after 11 turns with no findings recorded. Not an accuracy result |
 | `defective` fixture, second run | **Complete** | Scorer: TP 19, FP 1, FN 1; precision, recall and F1 0.95 (strict and lenient). 17 model turns, 22 inspection calls, 19 HTTP requests (two transient 503 responses retried), 209,936 input and 4,404 output tokens, about 290 s with 13 s request spacing |
 | `healthy` fixture, Gemini | **Incomplete** | The daily quota was exhausted on the first request; no Gemini healthy-fixture accuracy result |
@@ -327,8 +351,9 @@ live model.**
 * Gemini and the OpenRouter free router completed live audits before this refactor. The OpenRouter healthy run used six
   routed models, so it does not measure full-audit behaviour of any one pinned free model. Free models can be throttled or
   withdrawn at any time. The refactor itself was checked with mocked responses, not a new live audit.
-* Detection quality has been measured on the author's own fixtures: Gemini on the defective fixture and the OpenRouter
-  free router on the healthy fixture. Behaviour and false-positive rates on unseen repositories remain unmeasured.
+* Historical fixture scores do not establish general precision or recall. Subsequent public-repository evaluations have
+  shown missed security defects and contextual false positives. The current empty-finding self-review correction has
+  offline regression coverage; improved real-model recall has not been established.
 * OpenRouter's free tier has per-minute and per-day request limits. The agent stops cleanly when an identified daily limit
   is hit (exit 4, labeled partial output) but cannot work around it.
 * Redaction is heuristic. Unquoted YAML values are redacted only under secret-named keys and only when they contain a digit
@@ -348,7 +373,8 @@ auditor/                 internal implementation package
 tests/                  pytest suite (scripted fake model, fixture repositories, no network)
 eval/                   fixture generator with answer keys, and the scorer
 scripts/                helper script to regenerate the sample report
-sample_report.json      authentic example output (completed audit of octocat/Hello-World)
+sample_report.json      nonempty illustrative output (fictional findings, not a live audit)
+docs/sample_report.json  authentic historical output (completed audit of octocat/Hello-World)
 docs/sample_report.trace.json  trace of that run
 .env.example            variable names only, no credentials
 requirements.txt  pyproject.toml  .github/workflows/ci.yml
