@@ -66,6 +66,72 @@ def test_dynamic_follow_up_based_on_tool_output(sample_repo):
     assert reads == [{"path": "app/main.py"}]
 
 
+def test_root_secret_scan_delivers_evidence_for_model_directed_followup(sample_repo):
+    def inspect_candidate(messages):
+        result = last_tool_results(messages)[0]
+        assert "app/config.py:3" in result and "[REDACTED:" in result
+        return [call("read_file", path="app/config.py")]
+
+    llm = ScriptedLLM(
+        [
+            [call("scan_secrets", path=".")],
+            inspect_candidate,
+            [call("record_finding", **SECRET_FINDING)],
+            mark_all(),
+            [call("finish_audit")],
+            [call("finish_audit")],
+        ]
+    )
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u")
+    assert [f["rule_id"] for f in agent.run()] == ["SEC-001"]
+    assert [e["name"] for e in agent.trace.events if e["type"] == "tool_call"] == ["scan_secrets", "read_file"]
+
+
+def test_scripted_iac_fallback_survives_self_review_and_report_generation(tmp_path):
+    from conftest import make_git_repo
+
+    from auditor.report import build_report, validate_report
+
+    repo = make_git_repo(
+        tmp_path / "repo",
+        {"infra/policy.json": '{"Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}\n'},
+    )
+    finding = {
+        "rule_id": "SEC-901",
+        "category": "security",
+        "severity": "high",
+        "file": "infra/policy.json",
+        "line": 1,
+        "description": "IAM policy grants unrestricted actions on all resources",
+        "evidence": "The inspected policy allows Action * and Resource *; deployment is not established",
+        "recommendation": "Restrict actions and resources to the permissions required by the workload",
+    }
+
+    def record_after_inspection(messages):
+        assert '"Action": "*"' in last_tool_results(messages)[0]
+        return [call("record_finding", **finding)]
+
+    def finish_after_review(messages):
+        assert "Reconsider significant security concerns" in last_tool_results(messages)[0]
+        return [call("finish_audit")]
+
+    llm = ScriptedLLM(
+        [
+            [call("read_file", path="infra/policy.json")],
+            record_after_inspection,
+            mark_all(),
+            [call("finish_audit")],
+            finish_after_review,
+        ]
+    )
+    agent = AuditAgent(llm, RepoTools(repo), "u")
+    report = build_report("u", agent.run())
+    validate_report(report)
+    assert report == {"repository": "u", "violations": [finding]}
+    assert set(agent.reviewed) == set(prompts.CATEGORIES)
+    assert any(e.get("message") == "self-review requested" for e in agent.trace.events)
+
+
 def test_finding_without_inspection_is_rejected(sample_repo):
     llm = ScriptedLLM([[call("record_finding", **SECRET_FINDING)], mark_all(), [call("finish_audit")]])
     agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(self_review=False))
@@ -132,6 +198,18 @@ def test_prompt_guides_contextual_security_review_and_safe_recommendations():
     assert "unsafe deserialization" in prompt
     assert "Never recommend printing" in prompt
     assert "echoing or logging secrets" in prompt
+
+
+def test_prompt_distinguishes_credentials_context_and_authorized_fallback():
+    prompt = prompts.SYSTEM_PROMPT
+    assert "does not exempt deliberately insecure executable code or deployment configuration" in prompt
+    assert "do not assume attacker-controlled input" in prompt
+    assert "documentation-only examples" in prompt
+    assert "proves neither that the original value was fake nor that it was real" in prompt
+    assert "never force a finding into an unrelated rule" in prompt
+    assert "in-scope, evidence-backed violation" in prompt
+    assert "does not prove" in prompt and "live infrastructure exposure" in prompt
+    assert "without requiring a finding" in prompts.review_nudge("(none)")
 
 
 def test_coverage_nudge_before_finishing(sample_repo):

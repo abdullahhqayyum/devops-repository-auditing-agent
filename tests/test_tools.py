@@ -61,6 +61,68 @@ def test_scan_secrets_redacts(sample_repo):
     assert ".env.example" not in out.split("ignored")[0]
 
 
+def test_scan_secrets_root_paths_are_equivalent(sample_repo):
+    # An untracked credential-looking file must never enter the scan.
+    (sample_repo / "untracked.py").write_text(f'AWS_KEY = "{FAKE_KEY}"\n')
+    outputs = []
+    for path in (None, ".", "./"):
+        tools = RepoTools(sample_repo)
+        outputs.append(tools.scan_secrets(path))
+        assert tools.observed_files == {"app/config.py"}
+    assert outputs[0] == outputs[1] == outputs[2]
+    assert "app/config.py:3" in outputs[0]
+    assert "untracked.py" not in outputs[0]
+    assert FAKE_KEY not in outputs[0]
+    assert "[REDACTED:" in outputs[0]
+
+
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [
+        ("app/config.py", {"app/config.py"}),
+        ("app", {"app/config.py", "app/nested/key.py", "app/config.py.bak"}),
+        ("app/", {"app/config.py", "app/nested/key.py", "app/config.py.bak"}),
+        ("./app/nested", {"app/nested/key.py"}),
+        ("application", {"application/key.py"}),
+        ("src", {"src/key.py"}),
+        ("empty", set()),
+        ("missing", set()),
+    ],
+)
+def test_scan_secrets_respects_file_and_directory_boundaries(tmp_path, scope, expected):
+    from conftest import make_git_repo
+
+    files = ["app/config.py", "app/config.py.bak", "app/nested/key.py", "application/key.py", "src/key.py", "src_backup/key.py"]
+    repo = make_git_repo(tmp_path / "repo", dict.fromkeys(files, f'AWS_KEY = "{FAKE_KEY}"\n'))
+    (repo / "empty").mkdir()
+    tools = RepoTools(repo)
+    out = tools.scan_secrets(scope)
+    assert tools.observed_files == expected
+    assert FAKE_KEY not in out
+    for file in files:
+        assert (f"{file}:1 " in out) == (file in expected)
+    if not expected:
+        assert "No likely real credentials found" in out
+
+
+@pytest.mark.parametrize("scope", ["../outside.py", "../../outside", ".git/config"])
+def test_scan_secrets_rejects_unsafe_scopes(sample_repo, scope):
+    tools = RepoTools(sample_repo)
+    assert dispatch(tools, "scan_secrets", {"path": scope}).startswith("ERROR:")
+    assert not tools.observed_files
+
+
+def test_scan_secrets_keeps_placeholder_values_out_of_candidates(tmp_path):
+    from conftest import make_git_repo
+
+    repo = make_git_repo(tmp_path / "repo", {"config.py": 'API_TOKEN = "your-key-here"\n'})
+    tools = RepoTools(repo)
+    out = tools.scan_secrets(".")
+    assert "No likely real credentials found" in out
+    assert "1 placeholder/example-looking value(s) ignored" in out
+    assert not tools.observed_files
+
+
 def test_inspect_workflows_markers(sample_repo):
     out = RepoTools(sample_repo).inspect_workflows()
     assert "write-all" in out
