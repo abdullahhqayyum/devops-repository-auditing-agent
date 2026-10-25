@@ -16,11 +16,9 @@ from agent_loop import AuditAgent, AuditConfig
 from llm_client import (
     RATE_LIMIT_ATTEMPTS,
     TRANSIENT_ATTEMPTS,
-    AnthropicLLM,
     LLMBudgetExhausted,
     LLMError,
-    OllamaLLM,
-    OpenAILLM,
+    OpenRouterLLM,
     _classify,
     _retrying,
     _safe_message,
@@ -82,7 +80,7 @@ def http_error(status, message="boom", body=None, headers=None):
 
 
 def quota_body(*quota_ids, retry_delay=None, as_list=False):
-    """A Gemini-style 429 body: QuotaFailure violations, optional RetryInfo, dict or list (the compat layer uses a list)."""
+    """A structured 429 body with QuotaFailure and optional RetryInfo, including upstream error shapes."""
     details = [
         {
             "@type": "type.googleapis.com/google.rpc.QuotaFailure",
@@ -99,12 +97,9 @@ def quota_body(*quota_ids, retry_delay=None, as_list=False):
 
 
 # ------------------------------------------------------------ 1. single-layer retries
-@pytest.mark.parametrize("provider", ["openai", "gemini", "anthropic"])
-def test_sdk_clients_do_not_retry_on_their_own(monkeypatch, provider):
-    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "LLM_PROVIDER", "LLM_MODEL"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv({"openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}[provider], "k")
-    assert build_llm(provider).client.max_retries == 0
+def test_sdk_client_does_not_retry_on_its_own(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    assert build_llm().client.max_retries == 0
 
 
 def test_retry_policy_constants():
@@ -171,7 +166,7 @@ def test_error_body_shapes_are_classified_without_crashing(body, kind, window):
     assert (info.kind, info.window) == (kind, window)
 
 
-# ------------------------------------------------------------ 4. OpenAI insufficient_quota
+# ------------------------------------------------------------ 4. Structured insufficient_quota
 @pytest.mark.parametrize(
     "body",
     [
@@ -179,14 +174,14 @@ def test_error_body_shapes_are_classified_without_crashing(body, kind, window):
         [{"error": {"type": "insufficient_quota", "message": "billing"}}],
     ],
 )
-def test_openai_insufficient_quota_is_not_retried(clock, body):
+def test_structured_insufficient_quota_is_not_retried(clock, body):
     flaky = Flaky([http_error(429, "quota", body)] * 5)
     with pytest.raises(LLMError, match="insufficient_quota"):
         _retrying(flaky)
     assert flaky.calls == 1 and clock.sleeps == []
 
 
-def test_openai_plain_rate_limit_is_still_retried(clock):
+def test_plain_rate_limit_is_still_retried(clock):
     flaky = Flaky([http_error(429, "slow down", {"error": {"code": "rate_limit_exceeded"}})], result="ok")
     assert _retrying(flaky) == "ok" and flaky.calls == 2
 
@@ -251,7 +246,7 @@ def test_recovery_after_transient_503s(clock):
     assert flaky.calls == 3 and clock.sleeps == [3.0, 6.0]
 
 
-@pytest.mark.parametrize("error", [http_error(500), http_error(502), http_error(529), _TransientError("ollama 503")])
+@pytest.mark.parametrize("error", [http_error(500), http_error(502), http_error(529), _TransientError("empty response")])
 def test_eligible_temporary_failures_are_retried(clock, error):
     assert _retrying(Flaky([error])) == "ok"
 
@@ -269,13 +264,6 @@ def test_non_retryable_errors_fail_immediately(clock, status):
     with pytest.raises(LLMError, match="nope"):
         _retrying(flaky)
     assert flaky.calls == 1 and clock.sleeps == []
-
-
-def test_ollama_keeps_its_own_attempt_limit(clock):
-    flaky = Flaky([_TransientError("HTTP 503")] * 10)
-    with pytest.raises(LLMError, match="after 3 attempt"):
-        _retrying(flaky, attempts=3)
-    assert flaky.calls == 3
 
 
 # --------------------------------------------------- 9. deadline during retries and requests
@@ -302,7 +290,7 @@ def test_throttle_does_not_wait_past_the_deadline(clock):
     assert clock.sleeps == [10.0]
 
 
-class _CapturingOpenAI:
+class _CapturingCompletions:
     def __init__(self):
         self.kwargs = []
 
@@ -312,55 +300,28 @@ class _CapturingOpenAI:
         return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")], usage=None)
 
 
-def _openai_llm(capture, deadline=None):
-    llm = OpenAILLM.__new__(OpenAILLM)
-    llm.model, llm.fallbacks, llm.max_tokens, llm.throttle, llm.timeout = "m", [], 100, _Throttle(0), 120.0
+def _openrouter_llm(capture, deadline=None):
+    llm = OpenRouterLLM.__new__(OpenRouterLLM)
+    llm.model, llm.max_tokens, llm.throttle, llm.timeout = "m", 100, _Throttle(0), 120.0
     llm.deadline = deadline
     llm.client = SimpleNamespace(chat=SimpleNamespace(completions=capture))
     return llm
 
 
 def test_request_timeout_is_bounded_by_the_remaining_budget(clock):
-    capture = _CapturingOpenAI()
-    _openai_llm(capture, deadline=clock.now + 30).chat("s", [{"role": "user", "content": "hi"}], [])
+    capture = _CapturingCompletions()
+    _openrouter_llm(capture, deadline=clock.now + 30).chat("s", [{"role": "user", "content": "hi"}], [])
     assert capture.kwargs[0]["timeout"] == 30.0
-    capture = _CapturingOpenAI()
-    _openai_llm(capture).chat("s", [{"role": "user", "content": "hi"}], [])
+    capture = _CapturingCompletions()
+    _openrouter_llm(capture).chat("s", [{"role": "user", "content": "hi"}], [])
     assert capture.kwargs[0]["timeout"] == 120.0  # no deadline: the configured timeout
 
 
 def test_no_request_is_sent_once_the_budget_is_gone(clock):
-    capture = _CapturingOpenAI()
+    capture = _CapturingCompletions()
     with pytest.raises(LLMBudgetExhausted):
-        _openai_llm(capture, deadline=clock.now - 1).chat("s", [{"role": "user", "content": "hi"}], [])
+        _openrouter_llm(capture, deadline=clock.now - 1).chat("s", [{"role": "user", "content": "hi"}], [])
     assert capture.kwargs == []
-
-
-def test_anthropic_request_timeout_and_expired_budget(clock):
-    seen = []
-
-    class Messages:
-        def create(self, **kwargs):
-            seen.append(kwargs)
-            return SimpleNamespace(content=[SimpleNamespace(type="text", text="ok")], stop_reason="end_turn", usage=None)
-
-    llm = AnthropicLLM.__new__(AnthropicLLM)
-    llm.model, llm.fallbacks, llm.max_tokens, llm.throttle, llm.timeout = "m", [], 100, _Throttle(0), 120.0
-    llm.client = SimpleNamespace(messages=Messages())
-    llm.deadline = clock.now + 45
-    assert llm.chat("s", [{"role": "user", "content": "hi"}], []).text == "ok"
-    assert seen[0]["timeout"] == 45.0
-    llm.deadline = clock.now - 1
-    with pytest.raises(LLMBudgetExhausted):
-        llm.chat("s", [{"role": "user", "content": "hi"}], [])
-    assert len(seen) == 1
-
-
-def test_ollama_checks_the_budget_before_connecting():
-    llm = OllamaLLM("x", host="http://127.0.0.1:9", timeout=2)
-    llm.deadline = real_time.monotonic() - 1
-    with pytest.raises(LLMBudgetExhausted):
-        llm.chat("s", [{"role": "user", "content": "hi"}], [])
 
 
 # --------------------------------------------------------------- 10. sensitive error text

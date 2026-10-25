@@ -1,6 +1,6 @@
-"""Minimal LLM client layer (plain provider SDKs, no agent framework).
+"""OpenRouter client through the OpenAI-compatible SDK, without an agent framework.
 
-Internal message format, shared by all providers:
+Internal message format, shared with the hand-written agent loop:
     {"role": "user", "content": str}
     {"role": "assistant", "content": str, "tool_calls": [{"id", "name", "arguments": dict}]}
     {"role": "tool", "tool_call_id": str, "name": str, "content": str}
@@ -22,35 +22,15 @@ from typing import Any, Protocol
 
 log = logging.getLogger("audit.llm")
 
-DEFAULT_MODELS = {
-    "anthropic": "claude-sonnet-5-5",
-    "openai": "gpt-4.1",
-    "gemini": "gemini-3.6-flash",  # the model the live smoke and evaluation runs used successfully
-    "ollama": "qwen3:8b",
-    # OpenRouter's free router: it routes among free models and, when tools are sent, only to ones that support them.
-    # It may pick a different model each call; pin a specific tool-capable slug with --model for reproducible runs.
-    "openrouter": "openrouter/free",
-}
-# Tried in order when the default model has been retired (HTTP 404). Never used for an explicitly chosen model.
-FALLBACK_MODELS = {
-    "anthropic": ["claude-sonnet-4-5"],
-    "openai": ["gpt-4o", "gpt-5-mini"],
-    "gemini": ["gemini-3.5-flash", "gemini-flash-latest", "gemini-2.5-flash"],
-    "ollama": [],
-    "openrouter": [],  # model slugs are the user's choice; silently swapping one could switch to a paid model
-}
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+# OpenRouter's free router filters for the request's capabilities, including tools. It can select a different model
+# each turn; users may pin a tool-capable slug through --model or LLM_MODEL. No fallback can select a paid model.
+DEFAULT_MODEL = "openrouter/free"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-# Free-tier Gemini allows roughly 10 requests/minute, so space calls out by default. OpenRouter's free models are
-# documented at 20 requests/minute (account-wide), hence 3.5 s.
-DEFAULT_MIN_INTERVAL = {"anthropic": 0.0, "openai": 0.0, "gemini": 6.5, "ollama": 0.0, "openrouter": 3.5}
-OLLAMA_DEFAULT_HOST = "http://localhost:11434"
-OLLAMA_DEFAULT_NUM_CTX = 32768
-# Conversation size (characters) the agent keeps before eliding old tool output; small local contexts need less.
-DEFAULT_CONTEXT_CHARS = 220_000
-# OpenRouter serves many models with very different context windows; stay well inside the smaller ones (about 25k tokens).
-PROVIDER_CONTEXT_CHARS = {"openrouter": 100_000}
-# Retry policy. The SDKs are built with max_retries=0, so these are the only retries.
+# The free tier is documented at 20 requests/minute; 3.5 s stays below that account-wide limit.
+DEFAULT_MIN_INTERVAL = 3.5
+# OpenRouter serves models with different context windows, so trim history conservatively.
+CONTEXT_CHARS = 100_000
+# The SDK is built with max_retries=0, so these are the only retries.
 RATE_LIMIT_ATTEMPTS = 3  # total attempts for an HTTP 429 that is not known to be quota exhaustion
 TRANSIENT_ATTEMPTS = 6  # total attempts for timeouts, connection errors and 5xx
 RATE_LIMIT_BASE_DELAY = 5.0
@@ -68,7 +48,7 @@ class LLMBudgetExhausted(LLMError):
 
 
 class _TransientError(RuntimeError):
-    """Retryable failure raised by adapters that do not use a provider SDK."""
+    """Retryable failure when a completion response contains no choices."""
 
 
 @dataclass
@@ -77,7 +57,7 @@ class ToolCall:
     name: str
     arguments: dict[str, Any]
     parse_error: str | None = None
-    raw: dict[str, Any] | None = None  # provider payload echoed back verbatim (e.g. Gemini thought signatures)
+    raw: dict[str, Any] | None = None  # preserve any routed model extras when echoing tool calls
 
 
 @dataclass
@@ -109,7 +89,7 @@ class _ErrorInfo:
 
 
 TRANSIENT_STATUSES = (408, 409, 500, 502, 503, 504, 529)
-TRANSIENT_NAMES = ("APIConnectionError", "APITimeoutError", "InternalServerError", "OverloadedError")
+TRANSIENT_NAMES = ("APIConnectionError", "APITimeoutError", "InternalServerError")
 
 # Quota windows are only inferred from a structured quotaId, or from message wording that names the window.
 # Generic text such as "check your plan and billing details" appears on per-minute limits too and proves nothing.
@@ -192,7 +172,7 @@ def _retry_info_delay(errors: list[dict[str, Any]]) -> float | None:
 
 
 def _classify(exc: Exception) -> _ErrorInfo:
-    """Decide how a provider exception should be handled, from structured details first and wording second."""
+    """Decide how an OpenRouter exception should be handled, from structured details first and wording second."""
     status = getattr(exc, "status_code", None)
     if isinstance(exc, _TransientError) and status is None:
         return _ErrorInfo(status, "transient")
@@ -245,7 +225,7 @@ def _fatal_hint(info: _ErrorInfo, exc: Exception) -> str:
             " [hint: this model does not appear to support tool calling, which the agent requires; choose a tool-capable model]"
         )
     hints = {
-        401: " [hint: authentication failed; check the API key for this provider]",
+        401: " [hint: authentication failed; check OPENROUTER_API_KEY]",
         402: " [hint: payment required or insufficient credits, so the request is not retried; add credits or choose a free model]",
         403: " [hint: access denied; the key or project may lack permission for this model]",
         404: " [hint: model not found; check the model name or slug]",
@@ -306,7 +286,7 @@ def _retrying(call, attempts: int = TRANSIENT_ATTEMPTS, deadline: float | None =
             return call()
         except LLMError:
             raise
-        except Exception as exc:  # noqa: BLE001 - SDK exception types differ per provider
+        except Exception as exc:  # noqa: BLE001 - OpenRouter can relay different upstream error shapes
             name = type(exc).__name__
             info = _classify(exc)
             if info.kind == "fatal":
@@ -315,7 +295,7 @@ def _retrying(call, attempts: int = TRANSIENT_ATTEMPTS, deadline: float | None =
                 log.error("LLM quota exhausted (%s); not retrying", _describe(info))
                 raise LLMError(
                     f"LLM quota exhausted ({_describe(info)}; {info.reason}).{_reported_reset(exc)} Retrying will not help until the quota resets: "
-                    f"wait for the reset, use another project or key, or choose another provider or model. "
+                    f"wait for the reset or use an OpenRouter key with available allowance. "
                     f"Provider said: {_safe_message(exc, 300)}"
                 ) from exc
             limit = min(attempts, RATE_LIMIT_ATTEMPTS) if info.kind == "rate_limited" else attempts
@@ -348,6 +328,8 @@ def _retrying(call, attempts: int = TRANSIENT_ATTEMPTS, deadline: float | None =
             time.sleep(delay)
 
 
+# Also scrub any old provider keys inherited from the shell if an error happens to echo one. These variables never
+# select a provider; redaction.py separately detects credentials inside repositories being audited.
 _KEY_ENV_VARS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY")
 
 
@@ -365,13 +347,8 @@ def _safe_message(exc: Exception | None, limit: int = 400) -> str:
     return redact(text)[:limit]
 
 
-def _is_model_not_found(exc: LLMError) -> bool:
-    cause = exc.__cause__
-    return getattr(cause, "status_code", None) == 404 or type(cause).__name__ == "NotFoundError"
-
-
 class _Budgeted:
-    """Wall-clock budget shared by the adapters.
+    """Wall-clock budget for model requests.
 
     ``deadline`` is an absolute ``time.monotonic()`` value the agent sets before it starts. It bounds retry sleeps, the
     request throttle and each request's timeout. SDK timeouts apply per phase (connect, read, write), not to the whole
@@ -388,23 +365,6 @@ class _Budgeted:
         if remaining <= 0:
             raise LLMBudgetExhausted("wall-clock budget exhausted before the model request")
         return max(1.0, min(self.timeout, remaining))
-
-
-class _ModelFallback(_Budgeted):
-    """Switches to the next fallback model when the provider reports the current one does not exist."""
-
-    model: str
-    fallbacks: list[str]
-
-    def _with_fallback(self, call):
-        while True:
-            try:
-                return _retrying(call, deadline=self.deadline)
-            except LLMError as exc:
-                if not (self.fallbacks and _is_model_not_found(exc)):
-                    raise
-                log.warning("Model %s is unavailable; falling back to %s", self.model, self.fallbacks[0])
-                self.model = self.fallbacks.pop(0)
 
 
 class _Throttle:
@@ -424,104 +384,25 @@ class _Throttle:
         self._last = time.monotonic()
 
 
-class AnthropicLLM(_ModelFallback):
-    def __init__(
-        self, model: str | None = None, max_tokens: int = 4096, timeout: float = 120.0, min_interval: float = 0.0
-    ) -> None:
-        import anthropic
-
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            raise LLMError("ANTHROPIC_API_KEY is not set")
-        self.client = anthropic.Anthropic(timeout=timeout, max_retries=0)
-        self.timeout = timeout
-        self.model = model or DEFAULT_MODELS["anthropic"]
-        self.fallbacks = [] if model else list(FALLBACK_MODELS["anthropic"])
-        self.context_chars = DEFAULT_CONTEXT_CHARS
-        self.max_tokens = max_tokens
-        self.throttle = _Throttle(min_interval)
-
-    def _convert(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for m in messages:
-            if m["role"] == "user":
-                out.append({"role": "user", "content": m["content"]})
-            elif m["role"] == "assistant":
-                blocks: list[dict[str, Any]] = []
-                if m.get("content"):
-                    blocks.append({"type": "text", "text": m["content"]})
-                for tc in m.get("tool_calls", []):
-                    blocks.append({"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": tc["arguments"]})
-                out.append({"role": "assistant", "content": blocks or [{"type": "text", "text": "(no content)"}]})
-            elif m["role"] == "tool":
-                block = {"type": "tool_result", "tool_use_id": m["tool_call_id"], "content": m["content"]}
-                if out and out[-1]["role"] == "user" and isinstance(out[-1]["content"], list):
-                    out[-1]["content"].append(block)
-                else:
-                    out.append({"role": "user", "content": [block]})
-        return out
-
-    def chat(self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMResponse:
-        api_tools = [{"name": t["name"], "description": t["description"], "input_schema": t["parameters"]} for t in tools]
-        if api_tools:
-            api_tools[-1] = {**api_tools[-1], "cache_control": {"type": "ephemeral"}}
-        system_blocks = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
-
-        def call():
-            self.throttle.wait(self.deadline)
-            return self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                system=system_blocks,
-                messages=self._convert(messages),
-                tools=api_tools,
-                timeout=self._request_timeout(),
-            )
-
-        resp = self._with_fallback(call)
-        text_parts, calls = [], []
-        for block in resp.content:
-            if block.type == "text":
-                text_parts.append(block.text)
-            elif block.type == "tool_use":
-                calls.append(ToolCall(block.id, block.name, dict(block.input or {})))
-        usage = getattr(resp, "usage", None)
-        return LLMResponse(
-            "\n".join(text_parts).strip(),
-            calls,
-            resp.stop_reason,
-            getattr(usage, "input_tokens", 0) or 0,
-            getattr(usage, "output_tokens", 0) or 0,
-        )
-
-
-class OpenAILLM(_ModelFallback):
-    """OpenAI Chat Completions. Also serves OpenAI-compatible endpoints (Gemini, local servers)."""
+class OpenRouterLLM(_Budgeted):
+    """OpenRouter Chat Completions through the OpenAI-compatible SDK."""
 
     def __init__(
         self,
         model: str | None = None,
         max_tokens: int = 4096,
         timeout: float = 120.0,
-        api_key: str | None = None,
-        base_url: str | None = None,
-        min_interval: float = 0.0,
-        provider: str = "openai",
+        min_interval: float = DEFAULT_MIN_INTERVAL,
     ) -> None:
         import openai
 
-        key_var = "OPENROUTER_API_KEY" if provider == "openrouter" else "OPENAI_API_KEY"
-        api_key = api_key or os.environ.get(key_var)
+        api_key = os.environ.get("OPENROUTER_API_KEY")
         if not api_key:
-            raise LLMError(f"{key_var} is not set")
-        kwargs: dict[str, Any] = {"api_key": api_key, "timeout": timeout, "max_retries": 0}
-        if base_url:
-            kwargs["base_url"] = base_url
-        self.client = openai.OpenAI(**kwargs)
+            raise LLMError("OPENROUTER_API_KEY is not set")
+        self.client = openai.OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL, timeout=timeout, max_retries=0)
         self.timeout = timeout
-        self.model = model or DEFAULT_MODELS[provider]
-        # A custom OPENAI_BASE_URL serves its own model names, so OpenAI fallbacks would be meaningless there.
-        self.fallbacks = [] if model or (base_url and provider == "openai") else list(FALLBACK_MODELS[provider])
-        self.context_chars = PROVIDER_CONTEXT_CHARS.get(provider, DEFAULT_CONTEXT_CHARS)
+        self.model = model or DEFAULT_MODEL
+        self.context_chars = CONTEXT_CHARS
         self.max_tokens = max_tokens
         self.throttle = _Throttle(min_interval)
 
@@ -566,7 +447,7 @@ class OpenAILLM(_ModelFallback):
                     timeout=timeout,
                     **token_param,
                 )
-                if not getattr(resp, "choices", None):
+                if not getattr(resp, "choices", None) or not getattr(resp.choices[0], "message", None):
                     raise _EmptyCompletion(resp)
                 return resp
             except Exception as exc:  # newer models reject max_tokens
@@ -576,7 +457,7 @@ class OpenAILLM(_ModelFallback):
                     return call()
                 raise
 
-        resp = self._with_fallback(call)
+        resp = _retrying(call, deadline=self.deadline)
         choice = resp.choices[0]
         calls = []
         for tc in choice.message.tool_calls or []:
@@ -584,7 +465,7 @@ class OpenAILLM(_ModelFallback):
                 args = json.loads(tc.function.arguments or "{}")
                 err = None if isinstance(args, dict) else "arguments must be a JSON object"
                 args = args if isinstance(args, dict) else {}
-            except json.JSONDecodeError as exc:
+            except (json.JSONDecodeError, TypeError) as exc:
                 args, err = {}, f"invalid JSON arguments: {exc}"
             try:
                 raw = tc.model_dump(exclude_none=True)  # keeps provider extras such as thought signatures
@@ -601,150 +482,18 @@ class OpenAILLM(_ModelFallback):
         )
 
 
-class OllamaLLM(_Budgeted):
-    """Local models through Ollama's native /api/chat endpoint.
-
-    The native API is used (not Ollama's OpenAI-compatible one) so the context window can be set per request via
-    options.num_ctx; otherwise Ollama may silently truncate the long system prompt to its small default context.
-    """
-
-    def __init__(
-        self,
-        model: str | None = None,
-        host: str | None = None,
-        num_ctx: int = OLLAMA_DEFAULT_NUM_CTX,
-        timeout: float = 900.0,
-        max_tokens: int = 4096,
-    ) -> None:
-        self.model = model or DEFAULT_MODELS["ollama"]
-        self.host = (host or OLLAMA_DEFAULT_HOST).rstrip("/")
-        if not self.host.startswith(("http://", "https://")):
-            self.host = "http://" + self.host
-        self.num_ctx = num_ctx
-        self.timeout = timeout
-        self.max_tokens = max_tokens
-        # ~3 characters per token, minus room for the system prompt, tool schemas and the reply.
-        self.context_chars = max(20_000, int(num_ctx * 3) - 40_000)
-        self._ids = 0
-
-    def _convert(self, system: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = [{"role": "system", "content": system}]
-        for m in messages:
-            if m["role"] == "user":
-                out.append({"role": "user", "content": m["content"]})
-            elif m["role"] == "assistant":
-                msg: dict[str, Any] = {"role": "assistant", "content": m.get("content") or ""}
-                if m.get("tool_calls"):
-                    msg["tool_calls"] = [
-                        {"function": {"name": tc["name"], "arguments": tc["arguments"]}} for tc in m["tool_calls"]
-                    ]
-                out.append(msg)
-            elif m["role"] == "tool":
-                out.append({"role": "tool", "content": m["content"], "tool_name": m.get("name", "")})
-        return out
-
-    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
-        import urllib.error
-        import urllib.request
-
-        req = urllib.request.Request(
-            f"{self.host}/api/chat",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        request_timeout = self._request_timeout()
-        try:
-            with urllib.request.urlopen(req, timeout=request_timeout) as resp:
-                return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode(errors="replace")[:300]
-            if exc.code == 404 and "not found" in body.lower():
-                raise LLMError(f"Ollama model '{self.model}' is not installed; run: ollama pull {self.model}") from exc
-            if exc.code in (500, 502, 503):
-                raise _TransientError(f"Ollama HTTP {exc.code}: {body}") from exc
-            raise LLMError(f"Ollama HTTP {exc.code}: {body}") from exc
-        except urllib.error.URLError as exc:
-            raise LLMError(f"cannot reach Ollama at {self.host} ({exc.reason}); is `ollama serve` running?") from exc
-        except TimeoutError as exc:
-            raise LLMError(f"Ollama did not answer within {self.timeout:.0f}s; try a smaller model") from exc
-
-    def chat(self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMResponse:
-        payload = {
-            "model": self.model,
-            "messages": self._convert(system, messages),
-            "tools": [
-                {
-                    "type": "function",
-                    "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"]},
-                }
-                for t in tools
-            ],
-            "stream": False,
-            "options": {"num_ctx": self.num_ctx, "num_predict": self.max_tokens, "temperature": 0.2},
-        }
-        data = _retrying(lambda: self._post(payload), attempts=3, deadline=self.deadline)
-        msg = data.get("message") or {}
-        calls = []
-        for tc in msg.get("tool_calls") or []:
-            fn = tc.get("function") or {}
-            args = fn.get("arguments")
-            err = None
-            if isinstance(args, str):  # some models return a JSON string
-                try:
-                    args = json.loads(args or "{}")
-                except json.JSONDecodeError as exc:
-                    args, err = {}, f"invalid JSON arguments: {exc}"
-            if not isinstance(args, dict):
-                args, err = {}, err or "arguments must be a JSON object"
-            self._ids += 1
-            calls.append(ToolCall(tc.get("id") or f"ollama_{self._ids}", fn.get("name", ""), args, err))
-        text = (msg.get("content") or "").strip()
-        if "</think>" in text:  # drop inline reasoning blocks some local models emit
-            text = text.split("</think>", 1)[1].strip()
-        return LLMResponse(text, calls, data.get("done_reason"), data.get("prompt_eval_count") or 0, data.get("eval_count") or 0)
-
-
 def build_llm(provider: str | None = None, model: str | None = None) -> LLM:
-    provider = (provider or os.environ.get("LLM_PROVIDER") or "").strip().lower()
-    model = model or os.environ.get("LLM_MODEL") or None
-    if not provider:
-        if os.environ.get("ANTHROPIC_API_KEY"):
-            provider = "anthropic"
-        elif os.environ.get("OPENAI_API_KEY"):
-            provider = "openai"
-        elif os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
-            provider = "gemini"
-        elif os.environ.get("OPENROUTER_API_KEY"):
-            provider = "openrouter"  # last, so existing key-based detection is unchanged
-        else:
-            raise LLMError(
-                "No LLM credentials found: set ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY or OPENROUTER_API_KEY "
-                "(see .env.example)"
-            )
-    if provider not in DEFAULT_MODELS:
-        raise LLMError(f"Unsupported LLM_PROVIDER '{provider}' (use anthropic, openai, gemini, openrouter or ollama)")
+    """Build the only supported provider. ``provider`` remains for CLI compatibility."""
+    if provider is not None and provider.strip().lower() != "openrouter":
+        raise LLMError(f"Unsupported provider '{provider}' (use openrouter)")
+    # An obsolete LLM_PROVIDER from an older shell cannot redirect this client. If it also carried a provider-specific
+    # LLM_MODEL, ignore that inherited value; an explicit --model still wins.
+    legacy_provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
+    env_model = os.environ.get("LLM_MODEL") if legacy_provider in ("", "openrouter") else None
+    selected_model = model or env_model or DEFAULT_MODEL
     interval_env = os.environ.get("LLM_MIN_SECONDS_BETWEEN_CALLS", "").strip()
     try:
-        min_interval = float(interval_env) if interval_env else DEFAULT_MIN_INTERVAL[provider]
+        min_interval = float(interval_env) if interval_env else DEFAULT_MIN_INTERVAL
     except ValueError as exc:
         raise LLMError("LLM_MIN_SECONDS_BETWEEN_CALLS must be a number") from exc
-    if provider == "ollama":
-        try:
-            num_ctx = int(os.environ.get("OLLAMA_NUM_CTX") or OLLAMA_DEFAULT_NUM_CTX)
-        except ValueError as exc:
-            raise LLMError("OLLAMA_NUM_CTX must be an integer") from exc
-        return OllamaLLM(model, host=os.environ.get("OLLAMA_HOST") or None, num_ctx=num_ctx)
-    if provider == "anthropic":
-        return AnthropicLLM(model, min_interval=min_interval)
-    if provider == "gemini":
-        key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        if not key:
-            raise LLMError("GEMINI_API_KEY is not set")
-        return OpenAILLM(model, api_key=key, base_url=GEMINI_BASE_URL, min_interval=min_interval, provider="gemini")
-    if provider == "openrouter":
-        key = os.environ.get("OPENROUTER_API_KEY")
-        if not key:
-            raise LLMError("OPENROUTER_API_KEY is not set")
-        return OpenAILLM(model, api_key=key, base_url=OPENROUTER_BASE_URL, min_interval=min_interval, provider="openrouter")
-    return OpenAILLM(model, base_url=os.environ.get("OPENAI_BASE_URL") or None, min_interval=min_interval)
+    return OpenRouterLLM(selected_model, min_interval=min_interval)

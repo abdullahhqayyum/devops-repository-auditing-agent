@@ -38,18 +38,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--trace", default=None, help="Tool-call trace path (default: <output>.trace.json; 'none' to disable)")
     p.add_argument(
         "--provider",
-        default=None,
-        choices=["anthropic", "openai", "gemini", "openrouter", "ollama"],
-        help="LLM provider (default: env LLM_PROVIDER or auto)",
+        default="openrouter",
+        choices=["openrouter"],
+        help="LLM provider (OpenRouter only; retained for CLI compatibility)",
     )
-    p.add_argument("--model", default=None, help="Model name (default: env LLM_MODEL or provider default)")
+    p.add_argument("--model", default=None, help="OpenRouter model slug (default: env LLM_MODEL or openrouter/free)")
     p.add_argument("--max-steps", type=int, default=45, help="Maximum LLM investigation turns")
     p.add_argument("--max-tool-calls", type=int, default=120, help="Maximum inspection tool executions")
     p.add_argument(
         "--timeout",
         type=int,
         default=None,
-        help="Wall-clock budget in seconds (default 1500; 3600 for local Ollama). Running out ends the audit as incomplete "
+        help="Wall-clock budget in seconds (default 1500). Running out ends the audit as incomplete "
         "(exit 4, findings so far in <output>.partial). A request already in flight can overrun it slightly.",
     )
     p.add_argument(
@@ -71,7 +71,7 @@ def setup_logging(verbose: bool) -> None:
     root.handlers[:] = [handler]
     root.setLevel(logging.INFO if verbose else logging.WARNING)
     logging.getLogger("audit").setLevel(logging.INFO)
-    for noisy in ("httpx", "httpcore", "anthropic", "openai"):
+    for noisy in ("httpx", "httpcore", "openai"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
@@ -129,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
         config = AuditConfig(
             max_steps=args.max_steps,
             max_tool_calls=args.max_tool_calls,
-            wall_clock_seconds=args.timeout or (3600 if type(llm).__name__ == "OllamaLLM" else 1500),
+            wall_clock_seconds=args.timeout or 1500,
             context_char_budget=context_chars,
             keep_recent_tool_results=12 if context_chars >= 150_000 else 5,
         )

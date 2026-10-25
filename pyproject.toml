@@ -9,7 +9,6 @@ description = "LLM-driven agent that audits GitHub repositories for DevOps best-
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "anthropic>=0.40,<2",
     "openai>=1.40,<4",
     "PyYAML>=6.0,<7",
     "python-dotenv>=1.0,<2",
