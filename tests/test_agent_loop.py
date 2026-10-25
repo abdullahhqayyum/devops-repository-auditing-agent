@@ -2,6 +2,7 @@ from fakes import ScriptedLLM, call
 
 from auditor import prompts
 from auditor.agent_loop import AuditAgent, AuditConfig
+from auditor.llm_client import ToolCall
 from tools import RepoTools
 
 SECRET_FINDING = {
@@ -139,6 +140,85 @@ def test_context_trimming_preserves_tool_output_for_recorded_finding(sample_repo
     assert agent._trim_context()
     assert not agent.messages[1]["content"].startswith("[elided")
     assert agent.messages[2]["content"].startswith("[elided")
+
+
+def test_compacted_evidence_can_be_reread_before_recording_finding(sample_repo, monkeypatch):
+    """A later finding remains grounded when its first inspection was compacted."""
+    import auditor.agent_loop as agent_loop
+
+    capped_output = "\n".join(f"{line}: insecure setting" for line in range(1, 1201))[:12_000]
+    calls = []
+
+    def capped_dispatch(tools, name, args):
+        calls.append((name, args))
+        if name == "read_file":
+            tools.observed_files.add(args["path"])
+            return capped_output
+        return ""
+
+    monkeypatch.setattr(agent_loop, "dispatch", capped_dispatch)
+
+    def decide_after_compaction(messages):
+        config_result = next(
+            (message["content"] for message in messages if message.get("tool_call_id") == "config-read"),
+            "",
+        )
+        reread_result = next(
+            (message["content"] for message in messages if message.get("tool_call_id") == "config-reread"),
+            "",
+        )
+        if reread_result == capped_output:
+            return [
+                call(
+                    "record_finding",
+                    rule_id="SEC-001",
+                    category="security",
+                    severity="high",
+                    file="app/config.py",
+                    line=3,
+                    description="Insecure setting confirmed after rereading the file",
+                    evidence="3: insecure setting",
+                    recommendation="Replace the insecure setting with a secure configuration",
+                )
+            ]
+        if config_result.startswith("[elided"):
+            return [ToolCall("config-reread", "read_file", {"path": "app/config.py"})]
+        return [call("read_file", path="app/config.py")]
+
+    llm = ScriptedLLM(
+        [
+            [ToolCall("config-read", "read_file", {"path": "app/config.py"})],
+            *[[call("read_file", path="app/main.py")] for _ in range(8)],
+            decide_after_compaction,
+            decide_after_compaction,
+            mark_all(),
+            [call("finish_audit")],
+        ]
+    )
+    agent = AuditAgent(
+        llm,
+        RepoTools(sample_repo),
+        "u",
+        AuditConfig(
+            context_char_budget=20_000,
+            keep_recent_tool_results=1,
+            cache_inspection_results=False,
+            self_review=False,
+        ),
+    )
+
+    findings = agent.run()
+
+    assert findings and findings[0]["file"] == "app/config.py"
+    assert findings[0]["line"] == 3
+    assert any(args == {"path": "app/config.py"} for _, args in calls[1:])
+    assert any(e["type"] == "control" and e["message"] == "context trimmed" for e in agent.trace.events)
+    assistant_ids = {
+        call["id"] for message in agent.messages if message.get("role") == "assistant" for call in message.get("tool_calls", [])
+    }
+    tool_ids = {message["tool_call_id"] for message in agent.messages if message.get("role") == "tool"}
+    assert assistant_ids == tool_ids
+    assert set(prompts.CATEGORIES) == set(agent.reviewed)
 
 
 def test_default_context_policy_keeps_four_recent_tool_results():
