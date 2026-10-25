@@ -97,7 +97,10 @@ build_release
   BLD-001 Packaged/deployable project whose CI never builds it (no package build, docker build or compile step) although build config exists.
   BLD-002 Risky release/deploy automation: deploy/publish on every push or from any branch, without depending on tests (`needs:`), or with credentials passed insecurely.
   BLD-003 Unreproducible container build: base image unpinned or `:latest`, `apt-get install` of unpinned critical packages in release images, or no Dockerfile .dockerignore leading to secrets/venv in context (verify).
-Use the closest ID. If nothing fits, use the category prefix with a 9xx number (e.g. SEC-901).
+First check relevant named rules; never force a finding into an unrelated rule (e.g. Actions permissions for cloud IAM).
+If none fits an in-scope, evidence-backed violation, use its category prefix with a 9xx number (e.g. SEC-901).
+Describe the actual insecure construct with inspected file/line evidence. Source configuration alone does not prove
+successful exploitation, deployment or live infrastructure exposure.
 """.strip()
 
 SEVERITY_GUIDE = """
@@ -154,6 +157,11 @@ Before each tool call, write one short sentence of reasoning (what you expect to
 * Do not infer remote settings (branch protection, required reviews, environment approvals, repository secrets).
 * Placeholders (changeme, your-key-here, ${{VAR}}, os.environ lookups), test fixtures with obviously fake values and
   documentation examples are not leaked credentials.
+* This credential exception does not exempt deliberately insecure executable code or deployment configuration.
+  Educational/demo purpose informs applicability, impact and severity, not automatic dismissal. Distinguish unsafe
+  configuration from documentation-only examples and conditional risks: do not assume attacker-controlled input or
+  deployment circumstances without evidence. Report only concrete, inspected, in-scope violations.
+* A redaction marker conceals a value; it proves neither that the original value was fake nor that it was real.
 * Libraries legitimately use version ranges; small single-author projects do not need CODEOWNERS.
 * One finding per distinct defect. If the same pattern repeats inside one file, report it once (first occurrence) and
   mention the count in evidence. Separate defects in separate files are separate findings. Do not report the same root
@@ -264,7 +272,9 @@ def review_nudge(findings_text: str) -> str:
         "Before finishing, self-check your recorded findings for precision. For each one ask: is the evidence something "
         "I actually observed? Is there an acceptable alternative I overlooked? Is it a duplicate of another finding or "
         "the same root cause? Is the severity proportionate? Retract any that fail, add any well-evidenced violations you "
-        "noticed but did not record, then call finish_audit.\nCurrent findings:\n" + findings_text
+        "noticed but did not record. Reconsider significant security concerns dismissed solely because the repository "
+        "is educational/intentionally vulnerable or no named rule fits; use inspected evidence and the authorized "
+        "fallback, without requiring a finding. Then call finish_audit.\nCurrent findings:\n" + findings_text
     )
 
 
