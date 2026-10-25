@@ -315,7 +315,7 @@ class AuditAgent:
             and not str(message.get("content", "")).startswith("[elided")
             for message in self.messages
         ):
-            result = "Cached result from an identical earlier inspection; use that earlier tool result as evidence."
+            result = "See earlier identical inspection result."
             result = redact(result)
             self.trace.add(
                 "tool_call",

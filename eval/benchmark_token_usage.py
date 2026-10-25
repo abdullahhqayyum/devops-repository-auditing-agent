@@ -13,8 +13,7 @@ import json
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
