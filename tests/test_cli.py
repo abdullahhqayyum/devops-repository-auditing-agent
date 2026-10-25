@@ -62,3 +62,15 @@ def test_end_to_end_with_scripted_llm(sample_repo, tmp_path, monkeypatch):
 def test_local_path_requires_flag(sample_repo, tmp_path):
     code = cli.main(["--repo", str(sample_repo), "--output", str(tmp_path / "r.json")])
     assert code == cli.EXIT_USAGE
+
+
+def test_the_test_environment_is_isolated_from_the_developers_keys_and_dotenv():
+    import os
+
+    from conftest import LLM_ENV_VARS
+
+    assert [v for v in LLM_ENV_VARS if v in os.environ] == []
+    import dotenv
+
+    assert dotenv.load_dotenv() is False  # the real .env is never loaded during tests
+    assert [v for v in LLM_ENV_VARS if v in os.environ] == []
