@@ -1,4 +1,4 @@
-"""OpenRouter provider: selection, credentials, request/response compatibility, errors. Everything is mocked."""
+"""OpenRouter configuration, request/response compatibility and errors. Everything is mocked."""
 
 import json
 import logging
@@ -10,14 +10,10 @@ import pytest
 import agent as cli
 import llm_client
 from llm_client import (
-    DEFAULT_MODELS,
-    FALLBACK_MODELS,
-    GEMINI_BASE_URL,
+    DEFAULT_MODEL,
     OPENROUTER_BASE_URL,
-    AnthropicLLM,
     LLMError,
-    OllamaLLM,
-    OpenAILLM,
+    OpenRouterLLM,
     _retrying,
     _safe_message,
     _Throttle,
@@ -132,21 +128,22 @@ TOOLS = [
 
 
 # ----------------------------------------------------------------- selection, credentials, endpoint
-def test_openrouter_is_a_first_class_provider(env):
+def test_openrouter_is_the_only_provider(env):
     env.setenv("OPENROUTER_API_KEY", OR_KEY)
     llm = build_llm("openrouter")
-    assert isinstance(llm, OpenAILLM)  # the existing OpenAI-compatible adapter is reused, not duplicated
+    assert isinstance(llm, OpenRouterLLM)
     assert str(llm.client.base_url).rstrip("/") == OPENROUTER_BASE_URL == "https://openrouter.ai/api/v1"
-    assert llm.model == DEFAULT_MODELS["openrouter"] == "openrouter/free"
+    assert llm.model == DEFAULT_MODEL == "openrouter/free"
     assert llm.client.max_retries == 0  # the application's retry policy is the only retry layer
     assert llm.throttle.min_interval == 3.5 and llm.context_chars == 100_000
-    assert llm.fallbacks == []  # never silently swap to another (possibly paid) model
+    assert not hasattr(llm, "fallbacks")  # never silently swap to another (possibly paid) model
 
 
-def test_provider_can_come_from_the_environment_or_the_cli(env):
+def test_cli_defaults_to_openrouter_and_accepts_legacy_flag(env):
     env.setenv("OPENROUTER_API_KEY", OR_KEY)
-    env.setenv("LLM_PROVIDER", "openrouter")
+    env.setenv("LLM_PROVIDER", "gemini")
     assert build_llm().client.base_url.host == "openrouter.ai"
+    assert cli.parse_args(["--repo", "https://github.com/a/b", "--output", "r.json"]).provider == "openrouter"
     args = cli.parse_args(["--repo", "https://github.com/a/b", "--output", "r.json", "--provider", "openrouter"])
     assert args.provider == "openrouter"
     with pytest.raises(SystemExit):
@@ -170,22 +167,21 @@ def test_missing_key_errors_name_the_right_variable(env):
         build_llm("mistral")  # the unsupported-provider message lists the choices
 
 
-def test_only_an_openrouter_key_selects_openrouter_but_never_overrides_existing_detection(env):
+def test_other_provider_keys_do_not_change_selection(env):
     env.setenv("OPENROUTER_API_KEY", OR_KEY)
-    assert build_llm().client.base_url.host == "openrouter.ai"
     env.setenv("GEMINI_API_KEY", "g-key")
-    assert build_llm().client.base_url.host == "generativelanguage.googleapis.com"
     env.setenv("OPENAI_API_KEY", "o-key")
-    assert build_llm().client.base_url.host == "api.openai.com"
     env.setenv("ANTHROPIC_API_KEY", "a-key")
-    assert isinstance(build_llm(), AnthropicLLM)  # the original precedence is unchanged
+    env.setenv("LLM_PROVIDER", "anthropic")
+    assert isinstance(build_llm(), OpenRouterLLM)
+    assert build_llm().model == DEFAULT_MODEL
 
 
 @pytest.mark.parametrize("slug", [SLUG, "openrouter/free", "google/gemma-4-31b-it:free", "openai/gpt-4.1"])
 def test_model_slugs_are_passed_through_verbatim_and_pinned(env, slug):
     completions = Completions(completion("ok"))
     llm = make_llm(env, completions, model=slug)
-    assert llm.model == slug and llm.fallbacks == []
+    assert llm.model == slug
     llm.chat("sys", USER, TOOLS)
     assert completions.requests[0]["model"] == slug
 
@@ -260,6 +256,17 @@ def test_malformed_tool_arguments_are_reported_not_fatal(env):
     assert response.tool_calls[0].parse_error and "invalid JSON" in response.tool_calls[0].parse_error
 
 
+def test_non_string_tool_arguments_are_reported_not_fatal(env):
+    bad = SimpleNamespace(
+        id="call_x",
+        function=SimpleNamespace(name="read_file", arguments=123),
+        model_dump=lambda exclude_none=True: {},
+    )
+    response = make_llm(env, Completions(completion("", [bad]))).chat("s", USER, TOOLS)
+    assert response.tool_calls[0].arguments == {}
+    assert "invalid JSON arguments" in response.tool_calls[0].parse_error
+
+
 # --------------------------------------------------------------------------- errors and quotas
 def test_insufficient_credits_402_is_not_retried_and_explains_what_to_do(env, clock):
     body = {"error": {"code": 402, "message": "Insufficient credits. Add more using https://openrouter.ai/credits"}}
@@ -272,7 +279,7 @@ def test_insufficient_credits_402_is_not_retried_and_explains_what_to_do(env, cl
 
 def test_authentication_failure_401_is_not_retried(env, clock):
     completions = Completions(http_error(401, "Error code: 401 - No auth credentials found"))
-    with pytest.raises(LLMError, match="authentication failed; check the API key"):
+    with pytest.raises(LLMError, match="authentication failed; check OPENROUTER_API_KEY"):
         make_llm(env, completions).chat("s", USER, TOOLS)
     assert len(completions.requests) == 1 and clock.sleeps == []
 
@@ -349,6 +356,13 @@ def test_an_empty_completion_without_any_error_is_treated_as_transient(env, cloc
     assert make_llm(env, completions).chat("s", USER, TOOLS).text == "ok"
 
 
+def test_a_completion_without_a_message_is_retried_as_transient(env, clock):
+    broken = SimpleNamespace(choices=[SimpleNamespace(message=None)], error=None)
+    completions = Completions(broken, completion("ok"))
+    assert make_llm(env, completions).chat("s", USER, TOOLS).text == "ok"
+    assert len(completions.requests) == 2 and clock.sleeps == [3.0]
+
+
 def test_a_completion_carrying_a_402_error_is_fatal_with_the_credit_hint(env, clock):
     completions = Completions(SimpleNamespace(choices=None, error={"code": 402, "message": "Insufficient credits"}))
     with pytest.raises(LLMError, match="insufficient credits"):
@@ -362,34 +376,8 @@ def test_transient_upstream_errors_still_recover(env, clock):
     assert clock.sleeps == [3.0, 6.0]
 
 
-# --------------------------------------------------------------------- existing providers preserved
-def test_the_other_four_providers_are_unchanged(env):
-    env.setenv("ANTHROPIC_API_KEY", "a-key")
-    anthropic = build_llm("anthropic")
-    assert isinstance(anthropic, AnthropicLLM) and anthropic.model == DEFAULT_MODELS["anthropic"] == "claude-sonnet-5-5"
-    assert anthropic.client.max_retries == 0
-
-    env.setenv("OPENAI_API_KEY", "o-key")
-    openai = build_llm("openai")
-    assert isinstance(openai, OpenAILLM) and openai.model == "gpt-4.1" and openai.fallbacks == FALLBACK_MODELS["openai"]
-    assert openai.context_chars == 220_000 and openai.throttle.min_interval == 0
-    env.setenv("OPENAI_BASE_URL", "http://localhost:8080/v1")
-    custom = build_llm("openai")
-    assert str(custom.client.base_url).startswith("http://localhost:8080") and custom.fallbacks == []
-
-    env.setenv("GEMINI_API_KEY", "g-key")
-    gemini = build_llm("gemini")
-    assert str(gemini.client.base_url) == GEMINI_BASE_URL and gemini.model == "gemini-3.6-flash"
-    assert gemini.throttle.min_interval == 6.5 and gemini.context_chars == 220_000
-
-    ollama = build_llm("ollama")
-    assert isinstance(ollama, OllamaLLM) and ollama.model == "qwen3:8b"
-    assert set(DEFAULT_MODELS) == {"anthropic", "openai", "gemini", "ollama", "openrouter"}
-
-
-def test_openrouter_defaults_do_not_leak_into_other_providers(env):
-    env.setenv("OPENAI_API_KEY", "o-key")
-    assert build_llm("openai").throttle.min_interval == 0.0
+# --------------------------------------------------------------------- request spacing
+def test_request_spacing_can_be_overridden(env):
     env.setenv("LLM_MIN_SECONDS_BETWEEN_CALLS", "0")
     env.setenv("OPENROUTER_API_KEY", OR_KEY)
     assert build_llm("openrouter").throttle.min_interval == 0.0  # the override still works
@@ -424,14 +412,12 @@ def test_retry_helper_still_gives_up_on_credit_errors_for_any_status_carrier(clo
     assert len(calls) == 1 and clock.sleeps == []
 
 
-def test_direct_construction_with_the_openrouter_provider_uses_the_openrouter_variable(env):
+def test_direct_construction_uses_only_the_openrouter_variable(env):
     env.setenv("OPENAI_API_KEY", "sk-this-is-an-openai-key-0123456789")
     with pytest.raises(LLMError, match="OPENROUTER_API_KEY is not set"):
-        OpenAILLM(provider="openrouter", base_url=OPENROUTER_BASE_URL)
+        OpenRouterLLM()
     env.setenv("OPENROUTER_API_KEY", OR_KEY)
-    assert OpenAILLM(provider="openrouter", base_url=OPENROUTER_BASE_URL).client.api_key == OR_KEY
-    env.delenv("OPENROUTER_API_KEY")
-    assert OpenAILLM(provider="openai").client.api_key == "sk-this-is-an-openai-key-0123456789"  # plain OpenAI is unchanged
+    assert OpenRouterLLM().client.api_key == OR_KEY
 
 
 def test_a_configured_key_of_unknown_shape_is_scrubbed_from_errors_and_logs(env, clock, caplog):

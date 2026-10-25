@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 from fakes import ScriptedLLM, call
 
@@ -14,15 +15,11 @@ def test_invalid_url_exits_nonzero(tmp_path, capsys):
 
 
 def test_missing_credentials_exit_nonzero(tmp_path, monkeypatch, capsys):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setattr("dotenv.load_dotenv", lambda **_: False)
     code = cli.main(["--repo", "https://github.com/a/b", "--output", str(tmp_path / "r.json")])
     assert code == cli.EXIT_USAGE
-    assert "ANTHROPIC_API_KEY" in capsys.readouterr().err
+    assert "OPENROUTER_API_KEY" in capsys.readouterr().err
 
 
 def test_end_to_end_with_scripted_llm(sample_repo, tmp_path, monkeypatch):
@@ -57,6 +54,50 @@ def test_end_to_end_with_scripted_llm(sample_repo, tmp_path, monkeypatch):
 
     st = subprocess.run(["git", "status", "--porcelain"], cwd=sample_repo, capture_output=True, text=True)
     assert st.stdout == ""
+
+
+def test_cli_with_only_openrouter_key_and_mocked_sdk(sample_repo, tmp_path, monkeypatch):
+    """The required command runs through the real client and loop without a network request."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "router-test-key")
+    monkeypatch.setattr("llm_client.DEFAULT_MIN_INTERVAL", 0.0)
+    requests = []
+
+    def tool_call(call_id, name, arguments):
+        raw = {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments)},
+        }
+        return SimpleNamespace(
+            id=call_id,
+            function=SimpleNamespace(name=name, arguments=json.dumps(arguments)),
+            model_dump=lambda exclude_none=True: raw,
+        )
+
+    def fake_create(_self, **kwargs):
+        requests.append(kwargs)
+        turn = len(requests)
+        if turn == 1:
+            calls = [tool_call("list-1", "list_files", {})]
+        elif turn == 2:
+            calls = [
+                tool_call(f"review-{i}", "mark_reviewed", {"category": category, "status": "no_issues", "note": "ok"})
+                for i, category in enumerate(prompts.CATEGORIES)
+            ]
+        else:
+            calls = [tool_call("finish-1", "finish_audit", {})]
+        message = SimpleNamespace(content="", tool_calls=calls)
+        choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+        return SimpleNamespace(choices=[choice], usage=None)
+
+    monkeypatch.setattr("openai.resources.chat.completions.Completions.create", fake_create)
+    output = tmp_path / "openrouter-report.json"
+    code = cli.main(["--repo", str(sample_repo), "--allow-local", "--output", str(output)])
+    assert code == cli.EXIT_OK
+    assert json.loads(output.read_text()) == {"repository": str(sample_repo.resolve()), "violations": []}
+    assert [request["model"] for request in requests] == ["openrouter/free"] * 3
+    trace = json.loads((tmp_path / "openrouter-report.trace.json").read_text())
+    assert trace["status"] == "complete" and trace["tool_call_counts"] == {"list_files": 1}
 
 
 def test_local_path_requires_flag(sample_repo, tmp_path):
