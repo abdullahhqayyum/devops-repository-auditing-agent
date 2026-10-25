@@ -1,7 +1,10 @@
+import pytest
 from fakes import ScriptedLLM, call
 
 from auditor import prompts
 from auditor.agent_loop import AuditAgent, AuditConfig
+from auditor.llm_client import LLMBudgetExhausted
+from auditor.report import build_report, validate_report
 from tools import RepoTools
 
 SECRET_FINDING = {
@@ -48,6 +51,114 @@ def test_loop_executes_tools_and_records_finding(sample_repo):
     assert names == ["list_files", "read_file"]
     # Tool output was fed back to the model.
     assert any("app/config.py" in m.get("content", "") for m in llm.seen_messages[1] if m["role"] == "tool")
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_empty_report_self_review_is_optional_and_finishes_once(sample_repo, enabled):
+    def confirm_empty(messages):
+        assert last_tool_results(messages)[0] == prompts.review_nudge("(none)")
+        assert not agent.finished
+        return [call("finish_audit")]
+
+    llm = ScriptedLLM([mark_all(), [call("finish_audit")], confirm_empty])
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(self_review=enabled))
+    report = build_report("u", agent.run())
+    validate_report(report)
+    assert report == {"repository": "u", "violations": []}
+    assert agent.finished
+    assert len(llm.seen_messages) == (3 if enabled else 2)
+    assert sum(e.get("message") == "self-review requested" for e in agent.trace.events) == int(enabled)
+    assert agent.inspection_calls == 0
+
+
+def test_empty_review_can_record_previously_inspected_evidence(sample_repo):
+    def reconsider(messages):
+        assert last_tool_results(messages)[0] == prompts.review_nudge("(none)")
+        return [call("record_finding", **SECRET_FINDING)]
+
+    llm = ScriptedLLM(
+        [[call("read_file", path="app/config.py")], mark_all(), [call("finish_audit")], reconsider, [call("finish_audit")]]
+    )
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u")
+    report = build_report("u", agent.run())
+    validate_report(report)
+    assert report == {"repository": "u", "violations": [SECRET_FINDING]}
+    assert agent.finished
+    assert agent.inspection_calls == 1  # no forced reread or repeated inspection
+    assert len(llm.seen_messages) == 5
+    assert sum(e.get("message") == "self-review requested" for e in agent.trace.events) == 1
+
+
+def test_review_retraction_to_empty_does_not_request_another_review(sample_repo):
+    def retract_during_review(messages):
+        assert last_tool_results(messages)[0] == prompts.review_nudge(agent.store.summary_text())
+        return [
+            call(
+                "retract_finding",
+                finding_id="F1",
+                rule_id="SEC-001",
+                file="app/config.py",
+                line=3,
+                reason="Scripted review determined this synthetic value is a fixture",
+            )
+        ]
+
+    llm = ScriptedLLM(
+        [
+            [call("read_file", path="app/config.py")],
+            [call("record_finding", **SECRET_FINDING)],
+            mark_all(),
+            [call("finish_audit")],
+            retract_during_review,
+            [call("finish_audit")],
+        ]
+    )
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u")
+    assert build_report("u", agent.run()) == {"repository": "u", "violations": []}
+    assert agent.finished and "F1" in agent.store.retracted
+    assert len(llm.seen_messages) == 6
+    assert sum(e.get("message") == "self-review requested" for e in agent.trace.events) == 1
+
+
+@pytest.mark.parametrize("limit", ["steps", "tools"])
+def test_budget_wrapup_after_empty_review_finishes_without_repeated_review(sample_repo, limit):
+    def reach_limit(messages):
+        assert last_tool_results(messages)[0] == prompts.review_nudge("(none)")
+        return [call("list_files")]
+
+    config = AuditConfig(max_steps=3 if limit == "steps" else 45, max_tool_calls=1 if limit == "tools" else 120)
+    llm = ScriptedLLM([mark_all(), [call("finish_audit")], reach_limit, [call("finish_audit")]])
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u", config)
+    assert agent.run() == []
+    assert agent.finished and agent.in_wrapup
+    assert agent.inspection_calls == 1
+    assert len(llm.seen_messages) == 4
+    assert sum(e.get("message") == "self-review requested" for e in agent.trace.events) == 1
+
+
+def test_wrapup_finish_still_bypasses_self_review(sample_repo):
+    llm = ScriptedLLM([mark_all(), [call("finish_audit")]])
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(max_steps=1))
+    assert agent.run() == []
+    assert agent.finished and agent.in_wrapup
+    assert len(llm.seen_messages) == 2
+    assert not any(e.get("message") == "self-review requested" for e in agent.trace.events)
+
+
+def test_wall_clock_expiry_after_empty_review_remains_incomplete(sample_repo):
+    def expire_during_review(messages):
+        assert last_tool_results(messages)[0] == prompts.review_nudge("(none)")
+        agent.trace.started -= agent.config.wall_clock_seconds + 1
+        return [call("mark_reviewed", category="security", status="no_issues", note="No supported issue")]
+
+    llm = ScriptedLLM([mark_all(), [call("finish_audit")], expire_during_review])
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u")
+    with pytest.raises(LLMBudgetExhausted):
+        agent.run()
+    assert agent.stop_reason == "wall_clock_budget_exhausted"
+    assert not agent.finished
+    assert len(llm.seen_messages) == 3
+    assert sum(e.get("message") == "self-review requested" for e in agent.trace.events) == 1
 
 
 def test_dynamic_follow_up_based_on_tool_output(sample_repo):
