@@ -3,7 +3,7 @@
 An LLM-driven agent that clones a public GitHub repository (read-only), investigates it with inspection tools that **the
 model chooses itself**, and writes an evidence-based JSON report of DevOps best-practice violations.
 
-Assignment 2 of *MLOps & Production AI Engineering*. Repository: <https://github.com/abdullahhqayyum/devops-repository-auditing-agent>
+Assignment 2 of *MLOps*. Repository: <https://github.com/abdullahhqayyum/devops-repository-auditing-agent>
 
 * The agent loop, tool dispatch and control flow are hand-written Python (`agent_loop.py`). No agent framework
   (LangChain, LangGraph, n8n, ...) is used; OpenRouter is called through the OpenAI-compatible Python SDK.
