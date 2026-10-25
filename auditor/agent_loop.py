@@ -257,7 +257,7 @@ class AuditAgent:
             self._coverage_nudged = True
             self.trace.add("control", message="coverage nudge", missing=missing)
             return prompts.coverage_nudge(missing)
-        if self.config.self_review and not self._self_reviewed and self.store.findings:
+        if self.config.self_review and not self._self_reviewed:
             self._self_reviewed = True
             self.trace.add("control", message="self-review requested")
             return prompts.review_nudge(self.store.summary_text())
