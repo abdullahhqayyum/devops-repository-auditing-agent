@@ -1,6 +1,14 @@
 from conftest import FAKE_KEY
 
-from redaction import find_secrets, is_env_style, is_reference, looks_like_placeholder, redact, redact_data, redact_env_values
+from auditor.redaction import (
+    find_secrets,
+    is_env_style,
+    is_reference,
+    looks_like_placeholder,
+    redact,
+    redact_data,
+    redact_env_values,
+)
 
 
 def test_redacts_known_token_formats():

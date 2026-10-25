@@ -1,7 +1,7 @@
 from fakes import ScriptedLLM, call
 
-import prompts
-from agent_loop import AuditAgent, AuditConfig
+from auditor import prompts
+from auditor.agent_loop import AuditAgent, AuditConfig
 from tools import RepoTools
 
 SECRET_FINDING = {

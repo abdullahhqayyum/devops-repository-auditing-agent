@@ -5,7 +5,7 @@ from __future__ import annotations
 import itertools
 from collections.abc import Callable
 
-from llm_client import LLMResponse, ToolCall
+from auditor.llm_client import LLMResponse, ToolCall
 
 _ids = itertools.count(1)
 
