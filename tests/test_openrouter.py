@@ -221,6 +221,17 @@ def test_multiple_tool_calls_in_one_turn_are_parsed_in_order_with_their_ids(env)
     assert (response.input_tokens, response.output_tokens) == (120, 15)
 
 
+def test_request_telemetry_reports_retries_throttle_and_model(env, clock):
+    completions = Completions(http_error(503), completion("done"))
+    llm = make_llm(env, completions)
+    llm.throttle = _Throttle(10)
+    response = llm.chat("s", USER, TOOLS)
+    assert response.model == DEFAULT_MODEL
+    assert response.retry_count == 1
+    assert response.throttle_wait_seconds == 7
+    assert response.request_duration_seconds is not None
+
+
 def test_follow_up_turn_returns_every_tool_result_under_the_matching_call_id(env):
     first = completion("", [tool_call("call_a", "list_files", {}), tool_call("call_b", "read_file", {"path": "README.md"})])
     completions = Completions(first, completion("done"))

@@ -273,6 +273,22 @@ python eval/score.py "$env:TEMP\defective.json" "$env:TEMP\demo-repos\defective.
 `--allow-local` exists only for this workflow; normal use requires a GitHub URL. `make_demo_repo.py` deletes and recreates
 `<out>/defective` and `<out>/healthy`, so point `--out` at a scratch directory.
 
+### Offline token-usage benchmark
+
+`eval/benchmark_token_usage.py` runs deterministic scripted audits against temporary healthy and defective fixtures. It
+compares full-history requests with simulated conservative compaction, duplicate-call detection, and independent-call
+batching while reporting serialized request characters, model turns, inspection calls, completion, and evidence validity.
+It makes no network requests and writes no benchmark artifacts into the repository:
+
+```powershell
+python eval/benchmark_token_usage.py
+```
+
+Completed traces also include numeric `llm_telemetry` events for each model turn. These contain prompt/schema/history
+character counts, provider-reported token counts when available, tool-call/result sizes, request duration, retry and
+throttle measurements, model metadata, and whether context trimming occurred. Raw prompts, histories, tool results,
+credentials, and provider headers are never stored in telemetry.
+
 ### How to read the scores
 
 A reported violation counts as a **true positive (TP)** when it matches an unmatched answer-key entry (same file and rule id;
@@ -346,7 +362,7 @@ live model.**
 agent.py  tools.py       assignment-facing CLI and inspection-tool entry points
 auditor/                 internal implementation package
 tests/                  pytest suite (scripted fake model, fixture repositories, no network)
-eval/                   fixture generator with answer keys, and the scorer
+eval/                   fixture generator, scorer, and offline token benchmark
 scripts/                helper script to regenerate the sample report
 sample_report.json      authentic example output (completed audit of octocat/Hello-World)
 docs/sample_report.trace.json  trace of that run
