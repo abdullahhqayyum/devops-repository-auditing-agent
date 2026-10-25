@@ -7,10 +7,10 @@ import pytest
 from conftest import make_git_repo
 from fakes import ScriptedLLM, call
 
-import prompts
-from agent_loop import AuditAgent, AuditConfig
-from redaction import redact
-from report import FindingStore
+from auditor import prompts
+from auditor.agent_loop import AuditAgent, AuditConfig
+from auditor.redaction import redact
+from auditor.report import FindingStore
 from tools import RepoTools
 
 YAML_PW = "hunter2"  # synthetic

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from fakes import ScriptedLLM, call
 
 import agent as cli
-import prompts
+from auditor import prompts
 
 
 def test_invalid_url_exits_nonzero(tmp_path, capsys):
@@ -59,7 +59,7 @@ def test_end_to_end_with_scripted_llm(sample_repo, tmp_path, monkeypatch):
 def test_cli_with_only_openrouter_key_and_mocked_sdk(sample_repo, tmp_path, monkeypatch):
     """The required command runs through the real client and loop without a network request."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "router-test-key")
-    monkeypatch.setattr("llm_client.DEFAULT_MIN_INTERVAL", 0.0)
+    monkeypatch.setattr("auditor.llm_client.DEFAULT_MIN_INTERVAL", 0.0)
     requests = []
 
     def tool_call(call_id, name, arguments):

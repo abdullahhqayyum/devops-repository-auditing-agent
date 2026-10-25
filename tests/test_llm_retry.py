@@ -10,10 +10,10 @@ from conftest import FAKE_KEY
 from fakes import ScriptedLLM, call
 
 import agent as cli
-import llm_client
-import prompts
-from agent_loop import AuditAgent, AuditConfig
-from llm_client import (
+import auditor.llm_client as llm_client
+from auditor import prompts
+from auditor.agent_loop import AuditAgent, AuditConfig
+from auditor.llm_client import (
     RATE_LIMIT_ATTEMPTS,
     TRANSIENT_ATTEMPTS,
     LLMBudgetExhausted,
@@ -451,7 +451,7 @@ class _FakeWallClock:
 
 def test_wall_clock_expiring_between_turns_stops_without_a_wrapup_turn(sample_repo, monkeypatch):
     clock = _FakeWallClock()
-    monkeypatch.setattr("agent_loop.time", clock)
+    monkeypatch.setattr("auditor.agent_loop.time", clock)
 
     class SlowFirstTurn(ScriptedLLM):
         def chat(self, system, messages, tools):

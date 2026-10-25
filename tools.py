@@ -25,7 +25,7 @@ from typing import Any
 
 import yaml
 
-from redaction import find_secrets, is_env_style, redact, redact_env_values
+from auditor.redaction import find_secrets, is_env_style, redact, redact_env_values
 
 MAX_READ_LINES = 400
 MAX_FILE_BYTES = 2_000_000

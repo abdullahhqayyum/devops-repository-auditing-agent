@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 import agent as cli
-import llm_client
-from llm_client import (
+import auditor.llm_client as llm_client
+from auditor.llm_client import (
     DEFAULT_MODEL,
     OPENROUTER_BASE_URL,
     LLMError,
@@ -19,7 +19,7 @@ from llm_client import (
     _Throttle,
     build_llm,
 )
-from redaction import redact
+from auditor.redaction import redact
 
 OR_KEY = "sk-or-v1-" + "a1b2c3d4" * 8  # synthetic, shaped like an OpenRouter key
 SLUG = "nvidia/nemotron-3-super-120b-a12b:free"

@@ -19,7 +19,8 @@ dependencies = [
 dev = ["pytest>=8,<10"]
 
 [tool.setuptools]
-py-modules = ["agent", "agent_loop", "llm_client", "prompts", "redaction", "repo_loader", "report", "tools"]
+py-modules = ["agent", "tools"]
+packages = ["auditor"]
 
 [tool.ruff]
 line-length = 130

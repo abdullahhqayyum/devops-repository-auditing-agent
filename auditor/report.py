@@ -10,8 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from prompts import CATEGORIES, CATEGORY_ALIASES, RULE_PREFIX_TO_CATEGORY
-from redaction import redact
+from auditor.prompts import CATEGORIES, CATEGORY_ALIASES, RULE_PREFIX_TO_CATEGORY
+from auditor.redaction import redact
 
 SEVERITIES = ("critical", "high", "medium", "low")
 REPORT_FIELDS = ("rule_id", "category", "severity", "file", "line", "description", "evidence", "recommendation")

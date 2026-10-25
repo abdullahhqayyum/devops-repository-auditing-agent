@@ -8,4 +8,4 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 repo="${1:-https://github.com/octocat/Hello-World}"
-python agent.py --repo "$repo" --output sample_report.json --trace sample_report.trace.json -v
+python agent.py --repo "$repo" --output sample_report.json --trace docs/sample_report.trace.json -v

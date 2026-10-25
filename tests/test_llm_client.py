@@ -2,7 +2,7 @@
 
 import pytest
 
-from llm_client import DEFAULT_MODEL, LLMError, OpenRouterLLM, build_llm
+from auditor.llm_client import DEFAULT_MODEL, LLMError, OpenRouterLLM, build_llm
 
 HISTORY = [
     {"role": "user", "content": "audit"},

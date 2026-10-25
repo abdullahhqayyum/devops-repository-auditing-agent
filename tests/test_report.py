@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from report import FindingRejected, FindingStore, build_report, validate_report, write_json_atomic
+from auditor.report import FindingRejected, FindingStore, build_report, validate_report, write_json_atomic
 from tools import RepoTools
 
 

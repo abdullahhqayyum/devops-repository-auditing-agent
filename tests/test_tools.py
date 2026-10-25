@@ -318,7 +318,7 @@ def test_inspect_tracked_artifacts_registers_only_the_files_it_names(tmp_path):
 
 
 def test_a_finding_about_a_tracked_binary_artifact_needs_the_agent_to_have_seen_it(tmp_path):
-    from report import FindingRejected, FindingStore
+    from auditor.report import FindingRejected, FindingStore
 
     repo = _binary_repo(tmp_path)
     unseen = RepoTools(repo)
@@ -333,7 +333,7 @@ def test_a_finding_about_a_tracked_binary_artifact_needs_the_agent_to_have_seen_
 
 
 def test_listing_a_file_is_still_not_inspecting_it(tmp_path):
-    from report import FindingRejected, FindingStore
+    from auditor.report import FindingRejected, FindingStore
 
     t = RepoTools(_binary_repo(tmp_path))
     assert PYC in t.list_files()
