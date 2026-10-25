@@ -117,6 +117,30 @@ def test_context_trimming_keeps_pairs(sample_repo):
     assert len(tool_msgs) == len(calls)
 
 
+def test_context_trimming_preserves_tool_output_for_recorded_finding(sample_repo):
+    agent = AuditAgent(
+        ScriptedLLM([]),
+        RepoTools(sample_repo),
+        "u",
+        AuditConfig(context_char_budget=500, keep_recent_tool_results=0, self_review=False),
+    )
+    agent.tools.read_file("app/config.py")
+    agent.store.add(SECRET_FINDING)
+    agent.messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "finding-read", "name": "read_file", "arguments": {"path": "app/config.py"}}],
+        },
+        {"role": "tool", "tool_call_id": "finding-read", "name": "read_file", "content": "evidence " * 500},
+        {"role": "tool", "tool_call_id": "other", "name": "read_file", "content": "exploration " * 500},
+    ]
+
+    assert agent._trim_context()
+    assert not agent.messages[1]["content"].startswith("[elided")
+    assert agent.messages[2]["content"].startswith("[elided")
+
+
 def test_trace_never_contains_secrets_from_tool_arguments_or_reasons(sample_repo):
     import json
 

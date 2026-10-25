@@ -26,8 +26,8 @@ class AuditConfig:
     max_tool_calls: int = 120  # total inspection tool executions
     wrapup_steps: int = 4  # extra turns allowed after the budget is exhausted
     max_findings: int = 50
-    context_char_budget: int = 220_000
-    keep_recent_tool_results: int = 12
+    context_char_budget: int = 100_000
+    keep_recent_tool_results: int = 8
     wall_clock_seconds: int = 1500  # exceeding it ends the run as incomplete (LLMBudgetExhausted), with no wrap-up
     self_review: bool = True
     cache_inspection_results: bool = True
@@ -369,13 +369,23 @@ class AuditAgent:
             self.tokens["output"] += response.output_tokens
 
     def _trim_context(self) -> bool:
-        """Elide old tool outputs when the conversation grows too large (pairing stays intact)."""
+        """Elide old exploratory outputs while retaining tool-call pairing and cited finding files."""
         size = sum(len(m.get("content") or "") for m in self.messages)
         if size <= self.config.context_char_budget:
             return False
         compacted = False
+        protected_files = {finding.get("file") for finding in self.store.findings.values()}
+        protected_ids = {
+            call["id"]
+            for message in self.messages
+            if message.get("role") == "assistant"
+            for call in message.get("tool_calls", [])
+            if call.get("arguments", {}).get("path") in protected_files
+        }
         tool_idx = [i for i, m in enumerate(self.messages) if m["role"] == "tool"]
         for i in tool_idx[: max(0, len(tool_idx) - self.config.keep_recent_tool_results)]:
+            if self.messages[i].get("tool_call_id") in protected_ids:
+                continue
             content = self.messages[i]["content"]
             if len(content) > 300 and not content.startswith("[elided"):
                 self.messages[i]["content"] = "[elided to save context; first 200 chars] " + content[:200]
