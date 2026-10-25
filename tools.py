@@ -11,11 +11,13 @@ Design rules:
 from __future__ import annotations
 
 import fnmatch
+import importlib.util
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
@@ -104,6 +106,26 @@ UNTRUSTED_CONTEXTS = re.compile(
 
 class ToolError(Exception):
     """Raised for invalid tool input; the message is shown to the LLM."""
+
+
+def _ruff_command() -> list[str] | None:
+    """Command that runs the ruff installed for this interpreter, or None when ruff is not installed.
+
+    Tried in order: ``python -I -m ruff`` for the running interpreter (works when a virtual environment's
+    Scripts/bin directory is not on PATH), the ``ruff`` executable next to the interpreter, then ``ruff`` on PATH.
+
+    ``-I`` (isolated mode) is essential: the command runs with the audited repository as its working directory, and
+    without it a ``ruff.py`` or ``ruff/`` inside that repository would shadow the real package and execute
+    repository code.
+    """
+    if sys.executable and importlib.util.find_spec("ruff") is not None:
+        return [sys.executable, "-I", "-m", "ruff"]
+    if sys.executable:
+        sibling = Path(sys.executable).parent / ("ruff.exe" if os.name == "nt" else "ruff")
+        if sibling.is_file():
+            return [str(sibling)]
+    on_path = shutil.which("ruff")
+    return [on_path] if on_path else None
 
 
 class RepoTools:
@@ -235,6 +257,9 @@ class RepoTools:
         try:
             text = self._read_text(target)
         except ToolError as exc:
+            # The model has now seen that the file exists and is binary, which is all a finding about it
+            # (for example a tracked .pyc) can rest on.
+            self.observed_files.add(rel)
             return f"{rel}: {exc}"
         lines = text.splitlines()
         if lines and is_env_style(rel):
@@ -343,11 +368,13 @@ class RepoTools:
                 report.append(
                     f"[{label}] {len(matches)} tracked: " + ", ".join(matches[:15]) + (" ..." if len(matches) > 15 else "")
                 )
+                self.observed_files.update(matches[:15])  # only the files this output actually names
         ignored = [p for p in self._git("ls-files", "-ci", "--exclude-standard").splitlines() if p]
         if ignored:
             report.append(
                 f"[tracked_but_gitignored] {len(ignored)} file(s) tracked despite matching .gitignore: " + ", ".join(ignored[:15])
             )
+            self.observed_files.update(ignored[:15])
         gi = self.root / ".gitignore"
         report.append(".gitignore present at root: " + ("yes" if gi.is_file() else "NO"))
         large = []
@@ -360,6 +387,7 @@ class RepoTools:
                 large.append(f"{f} ({size // 1_000_000} MB)")
         if large:
             report.append("[large_files>5MB] " + ", ".join(large[:10]))
+            self.observed_files.update(entry.rsplit(" (", 1)[0] for entry in large[:10])
         if len(report) == 1:
             report.insert(0, "No suspicious tracked artifacts found.")
         report.append("Note: verify context before reporting (e.g. fixtures, intentionally vendored files, sample data).")
@@ -531,8 +559,8 @@ class RepoTools:
 
     def run_ruff(self, path: str | None = None) -> str:
         """Run the ruff linter (static analysis only; does not execute repository code)."""
-        exe = shutil.which("ruff")
-        if not exe:
+        ruff = _ruff_command()
+        if not ruff:
             return "ruff is not installed in the agent environment; this check is unavailable (do not infer results)."
         py_files = [f for f in self.tracked_files() if f.endswith(".py")]
         if not py_files:
@@ -543,7 +571,7 @@ class RepoTools:
         has_config = any((self.root / c).is_file() for c in ("ruff.toml", ".ruff.toml")) or "[tool.ruff" in self._safe_read(
             "pyproject.toml"
         )
-        args = [exe, "check", "--no-cache", "--exit-zero", "--output-format", "concise", "--force-exclude"]
+        args = [*ruff, "check", "--no-cache", "--exit-zero", "--output-format", "concise", "--force-exclude"]
         if not has_config:
             args.append("--isolated")  # ruff defaults only; ignore any user-level config on the agent host
         args.append(target)
@@ -561,7 +589,9 @@ class RepoTools:
             return self._finish(head + f"\nruff error: {proc.stderr.strip()[:500]}")
         summary = ", ".join(f"{c}x{n}" for c, n in codes.most_common(15))
         for ln in lines[:60]:
-            self.observed_files.add(ln.split(":", 1)[0].lstrip("./"))
+            reported = self.normalize_path(ln.split(":", 1)[0])  # ruff prints backslashes on Windows
+            if reported:
+                self.observed_files.add(reported)
         return self._finish(
             f"{head}\nBy rule: {summary or 'none'}\n"
             + "\n".join(lines[:60])
@@ -722,25 +752,88 @@ def tool_schemas(tools: RepoTools) -> list[dict[str, Any]]:
     return schemas
 
 
+def _json_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int | float):
+        return "number"
+    return {str: "string", dict: "object", list: "array"}.get(type(value), type(value).__name__)
+
+
+def _coerce_argument(value: Any, spec: dict[str, Any]) -> tuple[Any, str | None]:
+    """Check one LLM-provided argument against its schema entry; returns (value, error).
+
+    Accepts what model clients commonly send for numbers and flags (``"5"`` or ``5.0`` for an integer,
+    ``"true"`` for a boolean) and rejects everything else, so tools only ever see the declared types.
+    """
+    expected = spec.get("type", "string")
+    if expected == "string" and isinstance(value, str):
+        if "\0" in value:
+            return value, "must not contain NUL characters"
+        if "enum" in spec and value not in spec["enum"]:
+            return value, f"must be one of: {', '.join(spec['enum'])}"
+        return value, None
+    if expected == "integer" and not isinstance(value, bool):
+        if isinstance(value, int):
+            return value, None
+        if isinstance(value, float) and value.is_integer():
+            return int(value), None
+        if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+            return int(value), None
+    if expected == "boolean":
+        if isinstance(value, bool):
+            return value, None
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            return value.strip().lower() == "true", None
+    if expected not in ("string", "integer", "boolean"):
+        return value, None  # no other parameter types are declared today; leave them to the tool
+    return value, f"expected {expected}, got {_json_type(value)}"
+
+
 def dispatch(tools: RepoTools, name: str, arguments: dict[str, Any]) -> str:
-    """Execute a tool by name with LLM-provided arguments; errors become text for the LLM."""
-    allowed = {s["name"] for s in tool_schemas(tools)}
+    """Execute a tool by name with LLM-provided arguments; errors become text for the LLM.
+
+    Arguments are validated against the tool's schema first, so a malformed call yields a descriptive
+    ``ERROR:`` result the model can correct. Unexpected exceptions inside a tool are deliberately not caught here.
+    """
+    schemas = tool_schemas(tools)
+    allowed = {s["name"] for s in schemas}
     if name not in allowed:
         return f"ERROR: unknown tool '{name}'. Available: {', '.join(sorted(allowed))}"
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        return f"ERROR: arguments for {name} must be a JSON object, got {_json_type(arguments)}"
     fn: Callable[..., str] = getattr(tools, name)
-    schema = next(s for s in tool_schemas(tools) if s["name"] == name)
+    schema = next(s for s in schemas if s["name"] == name)
     props = schema["parameters"].get("properties", {})
-    clean = {k: v for k, v in (arguments or {}).items() if k in props and v is not None}
-    missing = [r for r in schema["parameters"].get("required", []) if r not in clean]
+    provided = {k: v for k, v in arguments.items() if v is not None}
+    missing = [r for r in schema["parameters"].get("required", []) if r not in provided]
     if missing:
         return f"ERROR: missing required argument(s): {', '.join(missing)}"
+    clean: dict[str, Any] = {}
+    problems: list[str] = []
+    for key, value in provided.items():
+        if key not in props:
+            continue
+        coerced, error = _coerce_argument(value, props[key])
+        if error:
+            problems.append(f"'{key}' {error}")
+        else:
+            clean[key] = coerced
+    if problems:
+        return f"ERROR: invalid argument(s) for {name}: " + "; ".join(problems)
+    unknown = sorted(str(k)[:40] for k in provided if k not in props)
     try:
-        return fn(**clean)
+        result = fn(**clean)
     except ToolError as exc:
         return f"ERROR: {exc}"
     except subprocess.TimeoutExpired:
         return f"ERROR: {name} timed out"
-    except (TypeError, ValueError) as exc:
-        return f"ERROR: invalid arguments for {name}: {exc}"
     except OSError as exc:
         return f"ERROR: {name} failed: {exc.strerror or exc}"
+    if unknown:
+        result += f"\n(note: ignored unknown argument(s): {', '.join(unknown)}; valid: {', '.join(props) or 'none'})"
+    return result

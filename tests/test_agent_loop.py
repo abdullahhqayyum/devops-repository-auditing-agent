@@ -142,3 +142,92 @@ def test_trace_never_contains_secrets_from_tool_arguments_or_reasons(sample_repo
     searches = [e for e in agent.trace.events if e["type"] == "tool_call" and e["name"] == "search_code"]
     assert searches[0]["arguments"] == {"pattern": "[REDACTED:aws_access_key_id]"}
     assert "F1" in agent.trace.events[-1]["retracted"]
+
+
+def test_malformed_tool_arguments_do_not_end_the_run_and_the_model_sees_the_error(sample_repo):
+    def retry_after_error(messages):
+        error = last_tool_results(messages)[0]
+        assert error.startswith("ERROR: invalid argument(s) for list_files: 'path' expected string, got object")
+        return [call("list_files", path="app")]  # the model corrects itself and carries on
+
+    llm = ScriptedLLM([[call("list_files", path={"dir": "app"})], retry_after_error, mark_all(), [call("finish_audit")]])
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(self_review=False))
+    agent.run()
+    assert agent.finished
+    calls = [e for e in agent.trace.events if e["type"] == "tool_call"]
+    assert [c["name"] for c in calls] == ["list_files", "list_files"]
+    assert "app/config.py" in calls[1]["output_preview"]
+
+
+def test_system_prompt_guides_batching_early_recording_and_negative_observations():
+    text = prompts.SYSTEM_PROMPT
+    assert "SAME turn" in text and "instead of one per" in text  # batch independent calls
+    assert "Go one step at a time only when the next call depends" in text  # but stay sequential when it does
+    assert "Record as you go" in text and "instead of holding everything back" in text
+    assert "Skip tools that cannot apply" in text
+    assert "Absence matters too" in text and "acceptable equivalent" in text
+    assert "together in one turn" in prompts.initial_message("u", "o")  # the first message carries its own reminder
+
+
+def test_prompt_guidance_is_generic_not_tied_to_any_repository():
+    for text in (prompts.SYSTEM_PROMPT, prompts.initial_message("u", "o")):
+        for demo_specific in ("jsmith", "Inventory", "tinycalc", "greet.yml", "prod-db.internal"):
+            assert demo_specific not in text
+
+
+def test_batched_calls_in_one_turn_are_all_executed_and_answered_in_order(sample_repo):
+    llm = ScriptedLLM(
+        [
+            [call("read_file", path="app/config.py"), call("read_file", path="app/main.py"), call("read_file", path="README.md")],
+            mark_all(),
+            [call("finish_audit")],
+        ]
+    )
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(self_review=False))
+    agent.run()
+    answers = [m for m in llm.seen_messages[1] if m["role"] == "tool"]
+    assert len(answers) == 3
+    assert [a["content"].split(" ", 1)[0] for a in answers] == ["app/config.py", "app/main.py", "README.md"]
+    assert {"app/config.py", "app/main.py", "README.md"} <= agent.tools.observed_files
+    assert agent.trace.events[-1]["steps"] == 3  # three files were read in a single model turn
+
+
+def test_a_finding_can_be_recorded_in_the_same_turn_as_the_read_that_supports_it(sample_repo):
+    llm = ScriptedLLM(
+        [
+            [
+                call("read_file", path="app/config.py"),
+                call("record_finding", **SECRET_FINDING),
+                call("read_file", path="app/main.py"),
+            ],
+            mark_all(),
+            [call("finish_audit")],
+            [call("finish_audit")],
+        ]
+    )
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u")
+    violations = agent.run()
+    assert [v["rule_id"] for v in violations] == ["SEC-001"]
+    findings = [e for e in agent.trace.events if e["type"] == "finding"]
+    assert findings and findings[0]["result"].startswith("Recorded")  # accepted mid-investigation, not at the end
+    assert [e["name"] for e in agent.trace.events if e["type"] == "tool_call"] == ["read_file", "read_file"]
+
+
+def test_a_dependent_followup_still_works_after_a_batched_turn(sample_repo):
+    def follow_up(messages):
+        results = [m["content"] for m in messages if m["role"] == "tool"][-2:]
+        assert any("verify=False" in r for r in results)  # the second turn reacts to what the batch returned
+        return [call("search_code", pattern="verify=False")]
+
+    llm = ScriptedLLM(
+        [
+            [call("read_file", path="app/main.py"), call("read_file", path="app/config.py")],
+            follow_up,
+            mark_all(),
+            [call("finish_audit")],
+        ]
+    )
+    agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(self_review=False))
+    agent.run()
+    names = [e["name"] for e in agent.trace.events if e["type"] == "tool_call"]
+    assert names == ["read_file", "read_file", "search_code"]

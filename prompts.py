@@ -116,9 +116,21 @@ Observe -> Reason -> Select tool -> Execute -> Interpret -> Record. You decide w
 based on what you have seen so far. Typical opening moves: list_files, then read the README/manifests to identify the
 stack, then inspect CI (inspect_workflows, then read_file on workflows), dependencies, tests, configuration and
 security. Follow leads: when one tool shows something suspicious, use read_file/search_code to confirm and to get the
-exact line. Prefer several targeted calls over guessing. You may call multiple tools in one turn when they are independent.
+exact line. Prefer several targeted calls over guessing.
 
 Before each tool call, write one short sentence of reasoning (what you expect to learn). Keep prose brief.
+
+## Working efficiently (every model turn costs time and API quota)
+* Batch independent calls. When you already know you need several files (manifests, workflows, Dockerfiles, tests,
+  configuration, application source), issue all of those read_file/search_code calls in the SAME turn instead of one per
+  turn. Go one step at a time only when the next call depends on what the previous one returns.
+* Record as you go. As soon as you have seen enough evidence for a violation, call record_finding (it can share a turn
+  with further inspection calls) instead of holding everything back until the end.
+* Prioritize files that tools flag as suspicious, then dependency manifests and lockfiles, CI workflows, Dockerfiles,
+  tests, configuration, and the application source the others refer to. Read source code, not only configuration.
+* Skip tools that cannot apply (for example run_ruff when there are no Python files).
+* Absence matters too. Missing tests, linter configuration, lockfiles or CI steps can be violations, but confirm the
+  absence first (list_files, search_code) and look for an acceptable equivalent before recording it.
 
 ## Recording results
 * record_finding(...) once per distinct, verified violation. The file must be a tracked path you inspected; use the
@@ -216,7 +228,8 @@ def initial_message(repo_url: str, overview: str) -> str:
     return (
         f"Audit this repository: {repo_url}\n"
         f"It has been cloned read-only (default branch). Initial observation:\n{overview}\n\n"
-        "Begin your investigation. Use the tools; do not guess."
+        "Begin your investigation. Use the tools; do not guess. Request independent files or checks together in one turn "
+        "and record each violation as soon as you have the evidence."
     )
 
 

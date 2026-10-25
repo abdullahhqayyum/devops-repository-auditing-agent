@@ -9,10 +9,10 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, NoReturn
 
 import prompts
-from llm_client import LLM, LLMResponse
+from llm_client import LLM, LLMBudgetExhausted, LLMError, LLMResponse
 from redaction import redact, redact_data
 from report import FindingRejected, FindingStore
 from tools import RepoTools, dispatch, tool_schemas
@@ -28,7 +28,7 @@ class AuditConfig:
     max_findings: int = 50
     context_char_budget: int = 220_000
     keep_recent_tool_results: int = 12
-    wall_clock_seconds: int = 1500
+    wall_clock_seconds: int = 1500  # exceeding it ends the run as incomplete (LLMBudgetExhausted), with no wrap-up
     self_review: bool = True
 
 
@@ -63,6 +63,7 @@ class AuditAgent:
         self.inspection_calls = 0
         self.finished = False
         self.in_wrapup = False
+        self.stop_reason: str | None = None  # set when the run ended early for a budget reason
         self._coverage_nudged = False
         self._self_reviewed = False
         self.tokens = {"input": 0, "output": 0}
@@ -91,13 +92,18 @@ class AuditAgent:
         idle_turns = 0
         step = 0
         wrapup_left = self.config.wrapup_steps
+        self._set_llm_deadline(self.config.wall_clock_seconds - (time.time() - self.trace.started))
 
         while not self.finished:
-            over_budget = (
-                step >= self.config.max_steps
-                or self.inspection_calls >= self.config.max_tool_calls
-                or time.time() - self.trace.started > self.config.wall_clock_seconds
-            )
+            if time.time() - self.trace.started > self.config.wall_clock_seconds:
+                self._abort(
+                    step,
+                    "wall_clock_budget_exhausted",
+                    LLMBudgetExhausted(
+                        f"the {self.config.wall_clock_seconds}s wall-clock budget ran out before the next model turn"
+                    ),
+                )
+            over_budget = step >= self.config.max_steps or self.inspection_calls >= self.config.max_tool_calls
             if over_budget and not self.in_wrapup:
                 self.in_wrapup = True
                 self.messages.append({"role": "user", "content": prompts.BUDGET_EXHAUSTED})
@@ -110,7 +116,12 @@ class AuditAgent:
 
             step += 1
             self._trim_context()
-            response = self.llm.chat(prompts.SYSTEM_PROMPT, self.messages, all_tools)
+            try:
+                response = self.llm.chat(prompts.SYSTEM_PROMPT, self.messages, all_tools)
+            except LLMBudgetExhausted as exc:
+                self._abort(step, "wall_clock_budget_exhausted", exc)
+            except LLMError as exc:
+                self._abort(step, "llm_error", exc)
             self._account(response)
             self.trace.add(
                 "llm_turn",
@@ -149,6 +160,10 @@ class AuditAgent:
                     result = self._execute(call.name, call.arguments) or "(empty output)"
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": result})
 
+        self._trace_finished(step)
+        return self.store.as_report_list()
+
+    def _trace_finished(self, step: int) -> None:
         self.trace.add(
             "finished",
             findings=len(self.store.findings),
@@ -156,8 +171,29 @@ class AuditAgent:
             reviewed=self.reviewed,
             tokens=self.tokens,
             steps=step,
+            stop_reason=self.stop_reason,
         )
-        return self.store.as_report_list()
+
+    def _abort(self, step: int, reason: str, exc: LLMError) -> NoReturn:
+        """End the run as incomplete: keep the findings and the trace, then re-raise so the caller exits nonzero."""
+        self.stop_reason = reason
+        log.error("Investigation incomplete (%s): %s", reason, redact(str(exc))[:300])
+        self.trace.add(
+            "control",
+            message=f"investigation incomplete: {reason}",
+            detail=str(exc)[:500],
+            elapsed_seconds=round(time.time() - self.trace.started, 1),
+            wall_clock_budget_seconds=self.config.wall_clock_seconds,
+            findings_kept=len(self.store.findings),
+        )
+        self._trace_finished(step)
+        raise exc
+
+    # ------------------------------------------------------------------ budget
+    def _set_llm_deadline(self, seconds: float) -> None:
+        """Tell the LLM adapter how long it may keep waiting and retrying (adapters without a deadline are left alone)."""
+        if hasattr(self.llm, "deadline"):
+            self.llm.deadline = time.monotonic() + max(0.0, seconds)
 
     # --------------------------------------------------------------- execution
     def _execute(self, name: str, args: dict[str, Any]) -> str:
