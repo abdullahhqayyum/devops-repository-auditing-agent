@@ -141,6 +141,11 @@ def test_context_trimming_preserves_tool_output_for_recorded_finding(sample_repo
     assert agent.messages[2]["content"].startswith("[elided")
 
 
+def test_default_context_policy_keeps_four_recent_tool_results():
+    assert AuditConfig().context_char_budget == 100_000
+    assert AuditConfig().keep_recent_tool_results == 4
+
+
 def test_trace_never_contains_secrets_from_tool_arguments_or_reasons(sample_repo):
     import json
 

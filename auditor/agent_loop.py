@@ -27,7 +27,7 @@ class AuditConfig:
     wrapup_steps: int = 4  # extra turns allowed after the budget is exhausted
     max_findings: int = 50
     context_char_budget: int = 100_000
-    keep_recent_tool_results: int = 8
+    keep_recent_tool_results: int = 4
     wall_clock_seconds: int = 1500  # exceeding it ends the run as incomplete (LLMBudgetExhausted), with no wrap-up
     self_review: bool = True
     cache_inspection_results: bool = True
