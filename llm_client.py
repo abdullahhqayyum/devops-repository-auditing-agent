@@ -16,7 +16,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 
@@ -27,6 +27,9 @@ DEFAULT_MODELS = {
     "openai": "gpt-4.1",
     "gemini": "gemini-3.6-flash",  # the model the live smoke and evaluation runs used successfully
     "ollama": "qwen3:8b",
+    # OpenRouter's free router: it routes among free models and, when tools are sent, only to ones that support them.
+    # It may pick a different model each call; pin a specific tool-capable slug with --model for reproducible runs.
+    "openrouter": "openrouter/free",
 }
 # Tried in order when the default model has been retired (HTTP 404). Never used for an explicitly chosen model.
 FALLBACK_MODELS = {
@@ -34,14 +37,19 @@ FALLBACK_MODELS = {
     "openai": ["gpt-4o", "gpt-5-mini"],
     "gemini": ["gemini-3.5-flash", "gemini-flash-latest", "gemini-2.5-flash"],
     "ollama": [],
+    "openrouter": [],  # model slugs are the user's choice; silently swapping one could switch to a paid model
 }
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-# Free-tier Gemini allows roughly 10 requests/minute, so space calls out by default.
-DEFAULT_MIN_INTERVAL = {"anthropic": 0.0, "openai": 0.0, "gemini": 6.5, "ollama": 0.0}
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# Free-tier Gemini allows roughly 10 requests/minute, so space calls out by default. OpenRouter's free models are
+# documented at 20 requests/minute (account-wide), hence 3.5 s.
+DEFAULT_MIN_INTERVAL = {"anthropic": 0.0, "openai": 0.0, "gemini": 6.5, "ollama": 0.0, "openrouter": 3.5}
 OLLAMA_DEFAULT_HOST = "http://localhost:11434"
 OLLAMA_DEFAULT_NUM_CTX = 32768
 # Conversation size (characters) the agent keeps before eliding old tool output; small local contexts need less.
 DEFAULT_CONTEXT_CHARS = 220_000
+# OpenRouter serves many models with very different context windows; stay well inside the smaller ones (about 25k tokens).
+PROVIDER_CONTEXT_CHARS = {"openrouter": 100_000}
 # Retry policy. The SDKs are built with max_retries=0, so these are the only retries.
 RATE_LIMIT_ATTEMPTS = 3  # total attempts for an HTTP 429 that is not known to be quota exhaustion
 TRANSIENT_ATTEMPTS = 6  # total attempts for timeouts, connection errors and 5xx
@@ -186,7 +194,7 @@ def _retry_info_delay(errors: list[dict[str, Any]]) -> float | None:
 def _classify(exc: Exception) -> _ErrorInfo:
     """Decide how a provider exception should be handled, from structured details first and wording second."""
     status = getattr(exc, "status_code", None)
-    if isinstance(exc, _TransientError):
+    if isinstance(exc, _TransientError) and status is None:
         return _ErrorInfo(status, "transient")
     errors = _error_objects(getattr(exc, "body", None))
     message = " ".join([str(exc), *(str(e.get("message", "")) for e in errors)])
@@ -214,6 +222,56 @@ def _classify(exc: Exception) -> _ErrorInfo:
     if status in TRANSIENT_STATUSES or type(exc).__name__ in TRANSIENT_NAMES:
         return _ErrorInfo(status, "transient", retry_after)
     return _ErrorInfo(status, "fatal")
+
+
+class _EmptyCompletion(_TransientError):
+    """A provider answered without any completion. OpenRouter can return an error object inside a 200 response; its
+    code and body are exposed like an HTTP error so the usual classification (429 quota, 402 credits, 5xx) applies."""
+
+    def __init__(self, resp: Any) -> None:
+        error = getattr(resp, "error", None)
+        error = error if isinstance(error, dict) else {}
+        super().__init__(str(error.get("message") or "the provider returned no completion"))
+        code = error.get("code")
+        self.status_code = int(code) if str(code).isdigit() else None
+        self.body = {"error": error} if error else None
+
+
+def _fatal_hint(info: _ErrorInfo, exc: Exception) -> str:
+    """Actionable advice for errors that are never retried: credentials, credits, unknown model, missing tool support."""
+    text = " ".join([str(exc), *(str(e.get("message", "")) for e in _error_objects(getattr(exc, "body", None)))]).lower()
+    if info.status in (400, 404, 422) and "tool" in text and any(w in text for w in ("support", "endpoint", "unsupported")):
+        return (
+            " [hint: this model does not appear to support tool calling, which the agent requires; choose a tool-capable model]"
+        )
+    hints = {
+        401: " [hint: authentication failed; check the API key for this provider]",
+        402: " [hint: payment required or insufficient credits, so the request is not retried; add credits or choose a free model]",
+        403: " [hint: access denied; the key or project may lack permission for this model]",
+        404: " [hint: model not found; check the model name or slug]",
+    }
+    return hints.get(info.status, "")
+
+
+def _reported_reset(exc: Exception) -> str:
+    """When the provider says a rate limit resets (OpenRouter reports ``X-RateLimit-Reset`` in the error metadata)."""
+    for error in _error_objects(getattr(exc, "body", None)):
+        metadata = error.get("metadata")
+        headers = metadata.get("headers") if isinstance(metadata, dict) else None
+        if not isinstance(headers, dict):
+            continue
+        for key, value in headers.items():
+            if str(key).lower() != "x-ratelimit-reset":
+                continue
+            try:
+                stamp = float(value)
+                moment = datetime.fromtimestamp(stamp / 1000 if stamp > 1e11 else stamp, timezone.utc)
+            except (TypeError, ValueError, OverflowError, OSError):
+                continue
+            now = datetime.now(timezone.utc)
+            if now <= moment <= now + timedelta(days=2):
+                return f" The provider reports the limit resets around {moment:%Y-%m-%d %H:%M} UTC."
+    return ""
 
 
 def _describe(info: _ErrorInfo) -> str:
@@ -252,11 +310,11 @@ def _retrying(call, attempts: int = TRANSIENT_ATTEMPTS, deadline: float | None =
             name = type(exc).__name__
             info = _classify(exc)
             if info.kind == "fatal":
-                raise LLMError(f"{name}: {_safe_message(exc)}") from exc
+                raise LLMError(f"{name}: {_safe_message(exc)}{_fatal_hint(info, exc)}") from exc
             if info.kind == "quota_exhausted":
                 log.error("LLM quota exhausted (%s); not retrying", _describe(info))
                 raise LLMError(
-                    f"LLM quota exhausted ({_describe(info)}; {info.reason}). Retrying will not help until the quota resets: "
+                    f"LLM quota exhausted ({_describe(info)}; {info.reason}).{_reported_reset(exc)} Retrying will not help until the quota resets: "
                     f"wait for the reset, use another project or key, or choose another provider or model. "
                     f"Provider said: {_safe_message(exc, 300)}"
                 ) from exc
@@ -290,7 +348,7 @@ def _retrying(call, attempts: int = TRANSIENT_ATTEMPTS, deadline: float | None =
             time.sleep(delay)
 
 
-_KEY_ENV_VARS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+_KEY_ENV_VARS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY")
 
 
 def _safe_message(exc: Exception | None, limit: int = 400) -> str:
@@ -451,9 +509,10 @@ class OpenAILLM(_ModelFallback):
     ) -> None:
         import openai
 
-        api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        key_var = "OPENROUTER_API_KEY" if provider == "openrouter" else "OPENAI_API_KEY"
+        api_key = api_key or os.environ.get(key_var)
         if not api_key:
-            raise LLMError("OPENAI_API_KEY is not set")
+            raise LLMError(f"{key_var} is not set")
         kwargs: dict[str, Any] = {"api_key": api_key, "timeout": timeout, "max_retries": 0}
         if base_url:
             kwargs["base_url"] = base_url
@@ -462,7 +521,7 @@ class OpenAILLM(_ModelFallback):
         self.model = model or DEFAULT_MODELS[provider]
         # A custom OPENAI_BASE_URL serves its own model names, so OpenAI fallbacks would be meaningless there.
         self.fallbacks = [] if model or (base_url and provider == "openai") else list(FALLBACK_MODELS[provider])
-        self.context_chars = DEFAULT_CONTEXT_CHARS
+        self.context_chars = PROVIDER_CONTEXT_CHARS.get(provider, DEFAULT_CONTEXT_CHARS)
         self.max_tokens = max_tokens
         self.throttle = _Throttle(min_interval)
 
@@ -500,13 +559,16 @@ class OpenAILLM(_ModelFallback):
             self.throttle.wait(self.deadline)
             timeout = self._request_timeout()
             try:
-                return self.client.chat.completions.create(
+                resp = self.client.chat.completions.create(
                     model=self.model,
                     messages=self._convert(system, messages),
                     tools=api_tools,
                     timeout=timeout,
                     **token_param,
                 )
+                if not getattr(resp, "choices", None):
+                    raise _EmptyCompletion(resp)
+                return resp
             except Exception as exc:  # newer models reject max_tokens
                 if "max_completion_tokens" in str(exc) and "max_tokens" in token_param:
                     token_param.clear()
@@ -653,10 +715,15 @@ def build_llm(provider: str | None = None, model: str | None = None) -> LLM:
             provider = "openai"
         elif os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
             provider = "gemini"
+        elif os.environ.get("OPENROUTER_API_KEY"):
+            provider = "openrouter"  # last, so existing key-based detection is unchanged
         else:
-            raise LLMError("No LLM credentials found: set ANTHROPIC_API_KEY, OPENAI_API_KEY or GEMINI_API_KEY (see .env.example)")
+            raise LLMError(
+                "No LLM credentials found: set ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY or OPENROUTER_API_KEY "
+                "(see .env.example)"
+            )
     if provider not in DEFAULT_MODELS:
-        raise LLMError(f"Unsupported LLM_PROVIDER '{provider}' (use anthropic, openai, gemini or ollama)")
+        raise LLMError(f"Unsupported LLM_PROVIDER '{provider}' (use anthropic, openai, gemini, openrouter or ollama)")
     interval_env = os.environ.get("LLM_MIN_SECONDS_BETWEEN_CALLS", "").strip()
     try:
         min_interval = float(interval_env) if interval_env else DEFAULT_MIN_INTERVAL[provider]
@@ -675,4 +742,9 @@ def build_llm(provider: str | None = None, model: str | None = None) -> LLM:
         if not key:
             raise LLMError("GEMINI_API_KEY is not set")
         return OpenAILLM(model, api_key=key, base_url=GEMINI_BASE_URL, min_interval=min_interval, provider="gemini")
+    if provider == "openrouter":
+        key = os.environ.get("OPENROUTER_API_KEY")
+        if not key:
+            raise LLMError("OPENROUTER_API_KEY is not set")
+        return OpenAILLM(model, api_key=key, base_url=OPENROUTER_BASE_URL, min_interval=min_interval, provider="openrouter")
     return OpenAILLM(model, base_url=os.environ.get("OPENAI_BASE_URL") or None, min_interval=min_interval)

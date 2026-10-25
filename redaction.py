@@ -22,6 +22,7 @@ TOKEN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("slack_webhook", re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/]{20,}")),
     ("stripe_key", re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b")),
     ("anthropic_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}")),
+    ("openrouter_key", re.compile(r"\bsk-or-v1-[A-Za-z0-9]{20,}")),  # before openai_key, whose pattern also matches
     ("openai_key", re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}")),
     ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
     ("sendgrid_key", re.compile(r"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b")),

@@ -43,3 +43,26 @@ SAMPLE_FILES = {
 @pytest.fixture
 def sample_repo(tmp_path: Path) -> Path:
     return make_git_repo(tmp_path / "repo", SAMPLE_FILES)
+
+
+LLM_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "LLM_PROVIDER",
+    "LLM_MODEL",
+    "OPENAI_BASE_URL",
+    "LLM_MIN_SECONDS_BETWEEN_CALLS",
+    "OLLAMA_HOST",
+    "OLLAMA_NUM_CTX",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolated_llm_environment(monkeypatch):
+    """No test may depend on, or load, the developer's real provider keys or .env file."""
+    for var in LLM_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *args, **kwargs: False)
