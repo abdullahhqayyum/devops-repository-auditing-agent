@@ -115,7 +115,8 @@ python agent.py --repo https://github.com/<owner>/<repo> --output report.json --
   (exit 4, labeled partial output). That limit is the upstream provider's shared free capacity for one model, separate from
   your account quota (the account showed 0 of 50 free requests used and no spend). A pinned free model can therefore be
   throttled for a while; `openrouter/free` routes among several free models and may avoid that, at the cost of
-  reproducibility. The run was not repeated, so full-audit behaviour on OpenRouter is still unverified.
+  reproducibility. That run was not repeated. A later healthy-fixture audit with `openrouter/free` completed; see the
+  evaluation results below.
 
 ## 3. Running
 
@@ -318,7 +319,7 @@ duplicate of an already matched defect. Known defects nobody reported are **fals
 
 ### Results that have actually been obtained
 
-All runs in the table used Gemini `gemini-3.6-flash` except the last row, which used an OpenRouter model. The fixtures are
+The first four runs used Gemini `gemini-3.6-flash`; the last two used OpenRouter. The fixtures are
 the author's own and were written alongside the rule catalog, so they measure whether the machinery works, not performance
 on unseen repositories. Scores from different models are not comparable with one another.
 
@@ -327,8 +328,20 @@ on unseen repositories. Scores from different models are not comparable with one
 | `octocat/Hello-World` (public) | **Complete** | 0 violations (the repository holds one README). 7 model turns, 7 inspection calls, 32,861 input and 611 output tokens. This is `sample_report.json` |
 | `defective` fixture, first attempt | **Incomplete** (daily quota) | Stopped after 11 turns with no findings recorded. Not an accuracy result |
 | `defective` fixture, second run | **Complete** | Scorer: TP 19, FP 1, FN 1; precision, recall and F1 0.95 (strict and lenient). 17 model turns, 22 inspection calls, 19 HTTP requests (two transient 503 responses retried), 209,936 input and 4,404 output tokens, about 290 s with 13 s request spacing |
-| `healthy` fixture | **Not completed** | The daily quota was exhausted on the first request, so the false-positive rate on a healthy repository is **unmeasured** |
+| `healthy` fixture, Gemini | **Incomplete** | The daily quota was exhausted on the first request; no Gemini healthy-fixture accuracy result |
 | `octocat/Hello-World`, OpenRouter `google/gemma-4-31b-it:free` | **Incomplete** | Authenticated, tool schemas accepted, one model-chosen `list_files` call, then upstream HTTP 429 on the next turn (6 requests in all, 2 turns). Exit 4 with a labeled partial file; not an accuracy result and not repeated |
+| `healthy` fixture, OpenRouter `openrouter/free` | **Complete** | 0 findings and 0 verified false positives on the eight-file fixture; 6 model turns and 11 inspection calls. Strict and lenient scorer: TP=0, FP=0, FN=0; precision, recall and F1 are N/A |
+
+The completed OpenRouter healthy run took 106 seconds and used 31,770 input plus 3,082 output tokens. There were seven
+completion attempts: six HTTP 200 responses and one connection failure recovered by the normal per-request retry; no
+upstream rate limit occurred. The response `model` fields identified six different free models:
+`cohere/north-mini-code:free`, `recursive/flint-v1.0:free`, `nvidia/nemotron-3-ultra-550b-a55b:free`,
+`liquid/lfm-2.5-2.6b:free`, `poolside/laguna-s-2.1:free`, and `nvidia/nemotron-3.5-super-vl:free`. The router may choose
+different models on another run, so this is a check of the free-router workflow, not a result for one pinned model. The
+agent read all eight tracked files, checked tracked artifacts, ran Ruff, marked all nine categories reviewed and called
+`finish_audit`. It did not call `scan_secrets` or run tests in a sandbox; a security review note inaccurately says
+`scan_secrets` ran. Zero reported findings means zero false positives on this fixture, but does not establish a general
+false-positive rate on unseen repositories.
 
 About the one scored miss in the second `defective` run: all 20 defects were reported, but HYG-003 (a tracked `.pyc`) was
 recorded with `file: null`. At that time `read_file` did not register a binary file as inspected, the evidence check rejected
@@ -339,11 +352,11 @@ live model.**
 
 ## 10. Known limitations
 
-* Only Gemini has completed live audits. Anthropic, OpenAI and Ollama are covered by mocked tests. OpenRouter is covered by
-  mocked tests plus one live attempt that was cut short by an upstream rate limit, so which free OpenRouter models complete a
-  full audit with the agent's tool schema is unmeasured. Free models can be throttled or withdrawn at any time.
-* Detection quality has been measured once, on the author's own fixtures. Behaviour on unseen repositories, and the false-positive
-  rate on a healthy repository, are not yet measured.
+* Gemini and the OpenRouter free router have completed live audits. Anthropic, OpenAI and Ollama are covered by mocked
+  tests. The OpenRouter healthy run used six routed models, so it does not measure full-audit behaviour of any one pinned
+  free model. Free models can be throttled or withdrawn at any time.
+* Detection quality has been measured on the author's own fixtures: Gemini on the defective fixture and the OpenRouter
+  free router on the healthy fixture. Behaviour and false-positive rates on unseen repositories remain unmeasured.
 * Gemini's free tier has per-minute and per-day request limits. The agent stops cleanly when the daily limit is hit
   (exit 4, labeled partial output) but cannot work around it.
 * Redaction is heuristic. Unquoted YAML values are redacted only under secret-named keys and only when they contain a digit
