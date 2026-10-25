@@ -95,7 +95,8 @@ def test_cli_with_only_openrouter_key_and_mocked_sdk(sample_repo, tmp_path, monk
     code = cli.main(["--repo", str(sample_repo), "--allow-local", "--output", str(output)])
     assert code == cli.EXIT_OK
     assert json.loads(output.read_text()) == {"repository": str(sample_repo.resolve()), "violations": []}
-    assert [request["model"] for request in requests] == ["openrouter/free"] * 3
+    assert [request["model"] for request in requests] == ["openrouter/free"] * 4  # includes empty-finding self-review
+    assert requests[3]["messages"][-1]["content"] == prompts.review_nudge("(none)")
     trace = json.loads((tmp_path / "openrouter-report.trace.json").read_text())
     assert trace["status"] == "complete" and trace["tool_call_counts"] == {"list_files": 1}
 
