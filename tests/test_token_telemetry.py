@@ -105,4 +105,4 @@ def test_duplicate_read_only_inspection_reuses_prior_result(sample_repo):
     assert len(calls) == 2
     assert calls[0]["cache_hit"] is False
     assert calls[1]["cache_hit"] is True
-    assert "earlier identical" in llm.seen_messages[2][-1]["content"]
+    assert "Earlier result" in llm.seen_messages[2][-1]["content"]
