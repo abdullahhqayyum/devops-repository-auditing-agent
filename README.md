@@ -5,7 +5,7 @@ model chooses itself**, and writes an evidence-based JSON report of DevOps best-
 
 Assignment 2 of *MLOps*. Repository: <https://github.com/abdullahhqayyum/devops-repository-auditing-agent>
 
-* The agent loop, tool dispatch and control flow are hand-written Python (`agent_loop.py`). No agent framework
+* The agent loop, tool dispatch and control flow are hand-written Python (`auditor/agent_loop.py`). No agent framework
   (LangChain, LangGraph, n8n, ...) is used; OpenRouter is called through the OpenAI-compatible Python SDK.
 * The model decides which tool to call next from what it has seen. There is no fixed checklist and no static scanner whose
   output is merely summarised.
@@ -152,20 +152,15 @@ is written (`report.validate_report`).
 
 `sample_report.json` is an authentic historical output from a Gemini `gemini-3.6-flash` audit of
 `https://github.com/octocat/Hello-World` (a one-file repository, so the violations list is genuinely empty).
-`sample_report.trace.json` is that run's trace. Neither artifact was regenerated for the OpenRouter-only refactor. They
+`docs/sample_report.trace.json` is that run's trace. Neither artifact was regenerated for the OpenRouter-only refactor. They
 predate the Ruff-detection fix described below, so the trace's `run_ruff` call honestly reports Ruff as unavailable.
 
 ## 5. Architecture
 
 ```
 agent.py          CLI: validate input, build the LLM client, clone read-only, run the agent, validate and write JSON
-agent_loop.py     The agent: message history, turn loop, tool dispatch, budgets, coverage and self-review nudges, trace
-llm_client.py     OpenRouter adapter, normalized LLM messages, retries, quota handling, deadline
 tools.py          Read-only inspection tools, their JSON schemas, argument validation and dispatch
-prompts.py        System prompt, rule catalog, severity guide, agent-control tools
-report.py         Finding validation (evidence grounding), de-duplication, contract check, atomic write
-redaction.py      Secret detection and redaction applied to tool output, logs, traces and report text
-repo_loader.py    GitHub URL validation, hardened shallow clone, read-only checkout, cleanup
+auditor/          Internal package containing the agent loop, OpenRouter client, prompts, reporting, redaction and repository loading
 ```
 
 ### The agent cycle
@@ -207,7 +202,7 @@ Tool output labelled "markers" or "heuristic" is a lead, not a conclusion; the p
 ### Audit categories
 
 Repository hygiene, dependency management, code quality, testing, CI (GitHub Actions), security, configuration,
-collaboration, build and release. `prompts.py` holds the rule catalog (for example `HYG-003` tracked generated files,
+collaboration, build and release. `auditor/prompts.py` holds the rule catalog (for example `HYG-003` tracked generated files,
 `DEP-003` inconsistent specifications, `CI-003` ineffective gates, `SEC-004` dangerous privileged triggers) together with
 the acceptable alternatives that must not be reported (any linter, any CI system, pinned `requirements.txt` as a lock,
 libraries may use ranges, no inference about remote branch protection).
@@ -348,12 +343,13 @@ live model.**
 ## 11. Project layout
 
 ```
-agent.py  agent_loop.py  llm_client.py  prompts.py  report.py  redaction.py  repo_loader.py  tools.py
+agent.py  tools.py       assignment-facing CLI and inspection-tool entry points
+auditor/                 internal implementation package
 tests/                  pytest suite (scripted fake model, fixture repositories, no network)
 eval/                   fixture generator with answer keys, and the scorer
 scripts/                helper script to regenerate the sample report
 sample_report.json      authentic example output (completed audit of octocat/Hello-World)
-sample_report.trace.json  trace of that run
+docs/sample_report.trace.json  trace of that run
 .env.example            variable names only, no credentials
 requirements.txt  pyproject.toml  .github/workflows/ci.yml
 ```
