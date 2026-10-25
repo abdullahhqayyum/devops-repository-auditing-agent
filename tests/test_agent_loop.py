@@ -74,6 +74,55 @@ def test_finding_without_inspection_is_rejected(sample_repo):
     assert "REJECTED" in rejected[0]["result"]
 
 
+def test_rejected_finding_cannot_retract_unrelated_active_finding(sample_repo):
+    class OfflineLLM:
+        model = "offline"
+
+    agent = AuditAgent(OfflineLLM(), RepoTools(sample_repo), "u", AuditConfig(self_review=False))
+    agent.tools.read_file("README.md")
+    valid = {
+        "rule_id": "CQ-001",
+        "category": "code_quality",
+        "severity": "medium",
+        "file": "README.md",
+        "line": 1,
+        "description": "A legitimate quality finding",
+        "evidence": "Observed quality issue",
+        "recommendation": "Apply the quality fix",
+    }
+    invalid = {
+        "rule_id": "HYG-001",
+        "category": "repository_hygiene",
+        "severity": "low",
+        "file": "README.md",
+        "line": 1,
+        "description": "Incorrect missing README finding",
+        "evidence": "README was mistakenly considered absent",
+    }
+
+    assert agent._execute("record_finding", valid) == "Recorded as F1."
+    assert agent._execute("record_finding", invalid).startswith("REJECTED: no finding was created; no finding ID was allocated.")
+    result = agent._execute(
+        "retract_finding",
+        {
+            "finding_id": "F1",
+            "rule_id": "HYG-001",
+            "file": "README.md",
+            "line": 1,
+            "reason": "intended to retract the rejected finding",
+        },
+    )
+    assert result.startswith("ERROR: retraction target for F1 does not match")
+    assert [finding["rule_id"] for finding in agent.store.as_report_list()] == ["CQ-001"]
+
+
+def test_retraction_schema_requires_target_identity():
+    schema = next(tool for tool in prompts.AGENT_TOOL_SCHEMAS if tool["name"] == "retract_finding")
+    assert schema["parameters"]["required"] == ["finding_id", "rule_id", "file", "line", "reason"]
+    assert schema["parameters"]["properties"]["file"]["type"] == ["string", "null"]
+    assert schema["parameters"]["properties"]["line"]["type"] == ["integer", "null"]
+
+
 def test_coverage_nudge_before_finishing(sample_repo):
     llm = ScriptedLLM([[call("finish_audit")], [call("finish_audit")]])
     agent = AuditAgent(llm, RepoTools(sample_repo), "u", AuditConfig(self_review=False))
@@ -128,7 +177,16 @@ def test_trace_never_contains_secrets_from_tool_arguments_or_reasons(sample_repo
             [call("search_code", pattern=FAKE_KEY)],
             [call("read_file", path="app/config.py")],
             [call("record_finding", **SECRET_FINDING)],
-            [call("retract_finding", finding_id="F1", reason=f"saw {FAKE_KEY} and password = '{pw}' in the log")],
+            [
+                call(
+                    "retract_finding",
+                    finding_id="F1",
+                    rule_id="SEC-001",
+                    file="app/config.py",
+                    line=3,
+                    reason=f"saw {FAKE_KEY} and password = '{pw}' in the log",
+                )
+            ],
             [call("no_such_tool", data={"nested": [f"password = '{pw}'", FAKE_KEY]})],
             mark_all(),
             [call("finish_audit")],
